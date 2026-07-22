@@ -18,6 +18,7 @@
 #include "google/cloud/storage/idempotency_policy.h"
 #include "google/cloud/storage/internal/generic_stub.h"
 #include "google/cloud/storage/internal/storage_connection.h"
+#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
 #include "google/cloud/storage/object_read_stream.h"
 #include "google/cloud/storage/retry_policy.h"
 #include "google/cloud/storage/version.h"
@@ -174,6 +175,7 @@ class StorageConnectionImpl
   std::vector<std::string> InspectStackStructure() const override;
 
  private:
+  std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager_;
   explicit StorageConnectionImpl(
       std::unique_ptr<storage_internal::GenericStub> stub, Options options);
 
