@@ -22,6 +22,7 @@
 namespace google {
 namespace cloud {
 namespace storage {
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
 HedgedObjectReadSource::HedgedObjectReadSource(
@@ -50,6 +51,12 @@ StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
   return HttpResponse{200, "", {}};
 }
 
+// A custom deleter for the shared_ptr to prevent it from deleting the
+// ObjectReadSource since we extract it back into a unique_ptr.
+struct NoOpDeleter {
+  void operator()(ObjectReadSource*) const {}
+};
+
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n) {
   if (!active_child_) {
       active_child_ = child_factory_();
@@ -71,60 +78,59 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       std::chrono::milliseconds duration;
   };
 
-  std::promise<RaceResult> promise;
-  auto future = promise.get_future();
+  auto promise = std::make_shared<std::promise<RaceResult>>();
+  auto future = promise->get_future();
   std::shared_ptr<std::atomic<bool>> resolved = std::make_shared<std::atomic<bool>>(false);
   
   auto start_time = std::chrono::steady_clock::now();
 
-  // Spawn primary thread
-  std::thread primary_thread([primary_source = std::move(active_child_), n, start_time, &promise, resolved]() mutable {
+  // We wrap the unique_ptr in a shared_ptr with a no-op deleter so we can
+  // capture it copy-by-value in the std::function, but reclaim it later.
+  auto shared_primary = std::shared_ptr<ObjectReadSource>(active_child_.release(), NoOpDeleter{});
+
+  // Submit primary task to thread pool
+  hedge_manager_->SubmitTask([shared_primary, n, start_time, promise, resolved]() {
       std::vector<char> local_buf(n);
-      auto res = primary_source->Read(local_buf.data(), n);
+      auto res = shared_primary->Read(local_buf.data(), n);
       auto end_time = std::chrono::steady_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
       
       bool expected = false;
       if (resolved->compare_exchange_strong(expected, true)) {
-          promise.set_value(RaceResult{std::move(res), std::move(primary_source), std::move(local_buf), duration});
+          // Clone shared_ptr back into a unique pointer for the winner
+          std::unique_ptr<ObjectReadSource> winner_ptr(shared_primary.get());
+          promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration});
       } else {
-          primary_source->Close();
+          shared_primary->Close();
       }
   });
 
-  std::thread hedge_thread;
-  bool hedge_spawned = false;
-
   // Wait for the primary to finish or timeout
   if (future.wait_for(target_delay) == std::future_status::timeout) {
-      hedge_spawned = true;
+      auto shared_hedge = std::shared_ptr<ObjectReadSource>(child_factory_().release(), NoOpDeleter{});
       
-      hedge_thread = std::thread([this, n, start_time, &promise, resolved]() mutable {
-          auto hedge_source = child_factory_();
+      // Submit hedge task to thread pool
+      hedge_manager_->SubmitTask([shared_hedge, n, start_time, promise, resolved]() {
           std::vector<char> local_buf(n);
-          if (!hedge_source) {
+          if (!shared_hedge) {
              return; 
           }
-          auto res = hedge_source->Read(local_buf.data(), n);
+          auto res = shared_hedge->Read(local_buf.data(), n);
           auto end_time = std::chrono::steady_clock::now();
           auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
           
           bool expected = false;
           if (resolved->compare_exchange_strong(expected, true)) {
-              promise.set_value(RaceResult{std::move(res), std::move(hedge_source), std::move(local_buf), duration});
+              std::unique_ptr<ObjectReadSource> winner_ptr(shared_hedge.get());
+              promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration});
           } else {
-              hedge_source->Close();
+              shared_hedge->Close();
           }
       });
   }
 
   auto final_result = future.get();
   
-  primary_thread.join();
-  if (hedge_spawned) {
-      hedge_thread.join();
-  }
-
   if (final_result.result.ok()) {
       hedge_manager_->RecordLatency(n, final_result.duration);
   }
@@ -139,6 +145,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
 }
 
 }  // namespace internal
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace storage
 }  // namespace cloud
 }  // namespace google

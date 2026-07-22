@@ -20,6 +20,10 @@
 #include <cstdint>
 #include <mutex>
 #include <vector>
+#include <thread>
+#include <queue>
+#include <functional>
+#include <condition_variable>
 
 namespace google {
 namespace cloud {
@@ -29,20 +33,23 @@ namespace internal {
 
 /**
  * Tracks the rolling p95 latency for GCS Object reads categorized by size bucket.
+ * Also owns a lightweight thread pool to safely execute and reap orphaned hedged requests.
  */
 class DynamicHedgeThresholdManager {
  public:
-  DynamicHedgeThresholdManager() = default;
-  ~DynamicHedgeThresholdManager() = default;
+  explicit DynamicHedgeThresholdManager(std::size_t num_threads = 4);
+  ~DynamicHedgeThresholdManager();
 
   // Records a successful read latency for a given byte size.
   void RecordLatency(std::size_t size, std::chrono::milliseconds latency);
 
   // Calculates the hedge delay based on the rolling p95 of the size bucket.
-  // Returns fallback delays if insufficient samples are present.
   std::chrono::milliseconds CalculateHedgeDelay(
       std::size_t size, double multiplier,
       std::chrono::milliseconds min_delay);
+
+  // Submits a background read task to the pool.
+  void SubmitTask(std::function<void()> task);
 
  private:
   struct SizeBucket {
@@ -55,13 +62,17 @@ class DynamicHedgeThresholdManager {
   SizeBucket& GetBucket(std::size_t size);
   std::chrono::milliseconds GetFallbackDelay(std::size_t size);
 
-  // We define fixed log2 buckets.
-  // 0-8KB, 8-64KB, 64-128KB, 128-256KB, 256-512KB, 512-1MB,
-  // 1-2MB, 2-8MB, 8-16MB, 16-32MB, 32-64MB, 64-128MB, 128-256MB, 256-512MB, 512MB+
   static constexpr std::size_t kNumBuckets = 15;
   SizeBucket buckets_[kNumBuckets];
   static constexpr std::size_t kMaxSamples = 100;
   static constexpr std::size_t kMinSamplesForP95 = 10;
+
+  // Thread pool members
+  std::vector<std::thread> workers_;
+  std::queue<std::function<void()>> tasks_;
+  std::mutex pool_mu_;
+  std::condition_variable condition_;
+  bool stop_ = false;
 };
 
 }  // namespace internal

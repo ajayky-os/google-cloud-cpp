@@ -27,6 +27,48 @@ constexpr std::size_t kKiB = 1024;
 constexpr std::size_t kMiB = 1024 * 1024;
 }  // namespace
 
+DynamicHedgeThresholdManager::DynamicHedgeThresholdManager(std::size_t num_threads) {
+  for (std::size_t i = 0; i < num_threads; ++i) {
+    workers_.emplace_back([this] {
+      while (true) {
+        std::function<void()> task;
+        {
+          std::unique_lock<std::mutex> lock(this->pool_mu_);
+          this->condition_.wait(lock, [this] { return this->stop_ || !this->tasks_.empty(); });
+          if (this->stop_ && this->tasks_.empty()) {
+            return;
+          }
+          task = std::move(this->tasks_.front());
+          this->tasks_.pop();
+        }
+        task();
+      }
+    });
+  }
+}
+
+DynamicHedgeThresholdManager::~DynamicHedgeThresholdManager() {
+  {
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    stop_ = true;
+  }
+  condition_.notify_all();
+  for (std::thread& worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+}
+
+void DynamicHedgeThresholdManager::SubmitTask(std::function<void()> task) {
+  {
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    if (stop_) return;
+    tasks_.emplace(std::move(task));
+  }
+  condition_.notify_one();
+}
+
 DynamicHedgeThresholdManager::SizeBucket& DynamicHedgeThresholdManager::GetBucket(std::size_t size) {
   if (size < 8 * kKiB) return buckets_[0];
   if (size < 64 * kKiB) return buckets_[1];
