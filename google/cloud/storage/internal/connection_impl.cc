@@ -14,6 +14,7 @@
 
 #include "google/cloud/storage/internal/connection_impl.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
+#include "google/cloud/storage/internal/hedged_object_read_source.h"
 #include "google/cloud/storage/parallel_upload.h"
 #include "google/cloud/internal/filesystem.h"
 #include "google/cloud/internal/opentelemetry.h"
@@ -154,7 +155,7 @@ std::shared_ptr<StorageConnectionImpl> StorageConnectionImpl::Create(
 StorageConnectionImpl::StorageConnectionImpl(
     std::unique_ptr<storage_internal::GenericStub> stub, Options options)
     : stub_(std::move(stub)),
-      options_(MergeOptions(std::move(options), stub_->options())) {}
+      options_(MergeOptions(std::move(options), stub_->options())), hedge_manager_(std::make_shared<DynamicHedgeThresholdManager>()) {}
 
 Options StorageConnectionImpl::options() const { return options_; }
 
@@ -391,15 +392,26 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
         *current, request, where);
   };
 
-  auto retry_policy = current->get<RetryPolicyOption>()->clone();
-  auto backoff_policy = current->get<BackoffPolicyOption>()->clone();
-  auto child = factory(request, *retry_policy, *backoff_policy);
-  if (!child) return child;
+  auto retry_source_factory = [f = std::move(factory), c = std::move(current), r = request]() mutable {
+      auto retry_policy = c->get<RetryPolicyOption>()->clone();
+      auto backoff_policy = c->get<BackoffPolicyOption>()->clone();
+      auto child_retry = f(r, *retry_policy, *backoff_policy);
+      if (!child_retry) return std::unique_ptr<storage::internal::ObjectReadSource>();
+      return std::unique_ptr<storage::internal::ObjectReadSource>(
+          std::make_unique<RetryObjectReadSource>(
+              f, c, r, *std::move(child_retry),
+              std::move(retry_policy), std::move(backoff_policy)));
+  };
+
+  bool enable_hedging = options().get<storage_experimental::EnableReadHedgingOption>();
+  double multiplier = options().get<storage_experimental::DynamicHedgeMultiplierOption>();
+  auto min_delay = options().get<storage_experimental::ReadHedgeDelayOption>();
+  int max_hedges = options().get<storage_experimental::MaxReadHedgesOption>();
 
   return std::unique_ptr<ObjectReadSource>(
-      std::make_unique<RetryObjectReadSource>(
-          std::move(factory), std::move(current), request, *std::move(child),
-          std::move(retry_policy), std::move(backoff_policy)));
+      std::make_unique<HedgedObjectReadSource>(
+          hedge_manager_, request, std::move(retry_source_factory),
+          enable_hedging, multiplier, min_delay, max_hedges));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(
