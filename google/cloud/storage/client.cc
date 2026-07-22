@@ -581,6 +581,23 @@ Options DefaultOptions(Options opts) {
                                                                 "/iamapi");
   }
 
+
+  if (!o.has<storage_experimental::EnableReadHedgingOption>()) {
+    o.set<storage_experimental::EnableReadHedgingOption>(false);
+  }
+  if (!o.has<storage_experimental::HedgingStrategyOption>()) {
+    o.set<storage_experimental::HedgingStrategyOption>(storage_experimental::HedgingStrategy::kDynamic);
+  }
+  if (!o.has<storage_experimental::ReadHedgeDelayOption>()) {
+    o.set<storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(500));
+  }
+  if (!o.has<storage_experimental::DynamicHedgeMultiplierOption>()) {
+    o.set<storage_experimental::DynamicHedgeMultiplierOption>(1.5);
+  }
+  if (!o.has<storage_experimental::MaxReadHedgesOption>()) {
+    o.set<storage_experimental::MaxReadHedgesOption>(2);
+  }
+
   auto logging = GetEnv("CLOUD_STORAGE_ENABLE_TRACING");
   if (logging) {
     for (auto c : absl::StrSplit(*logging, ',')) {
