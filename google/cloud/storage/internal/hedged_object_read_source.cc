@@ -51,6 +51,16 @@ StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
   return HttpResponse{200, "", {}};
 }
 
+enum class SourceType { kPrimary, kHedge };
+
+struct RaceResult {
+    StatusOr<ReadSourceResult> result;
+    std::unique_ptr<ObjectReadSource> winner_source;
+    std::vector<char> winner_buffer;
+    std::chrono::milliseconds duration;
+    SourceType winner_type;
+};
+
 // A custom deleter for the shared_ptr to prevent it from deleting the
 // ObjectReadSource since we extract it back into a unique_ptr.
 struct NoOpDeleter {
@@ -71,25 +81,17 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
 
   auto target_delay = hedge_manager_->CalculateHedgeDelay(n, multiplier_, min_delay_);
 
-  struct RaceResult {
-      StatusOr<ReadSourceResult> result;
-      std::unique_ptr<ObjectReadSource> winner_source;
-      std::vector<char> winner_buffer;
-      std::chrono::milliseconds duration;
-  };
-
   auto promise = std::make_shared<std::promise<RaceResult>>();
   auto future = promise->get_future();
-  std::shared_ptr<std::atomic<bool>> resolved = std::make_shared<std::atomic<bool>>(false);
+  auto resolved = std::make_shared<std::atomic<bool>>(false);
   
   auto start_time = std::chrono::steady_clock::now();
 
-  // We wrap the unique_ptr in a shared_ptr with a no-op deleter so we can
-  // capture it copy-by-value in the std::function, but reclaim it later.
   auto shared_primary = std::shared_ptr<ObjectReadSource>(active_child_.release(), NoOpDeleter{});
+  auto primary_done = std::make_shared<std::atomic<bool>>(false);
 
-  // Submit primary task to thread pool
-  hedge_manager_->SubmitTask([shared_primary, n, start_time, promise, resolved]() {
+  // Spawn primary thread
+  std::thread primary_thread([shared_primary, n, start_time, promise, resolved, primary_done]() {
       std::vector<char> local_buf(n);
       auto res = shared_primary->Read(local_buf.data(), n);
       auto end_time = std::chrono::steady_clock::now();
@@ -97,39 +99,57 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       
       bool expected = false;
       if (resolved->compare_exchange_strong(expected, true)) {
-          // Clone shared_ptr back into a unique pointer for the winner
           std::unique_ptr<ObjectReadSource> winner_ptr(shared_primary.get());
-          promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration});
-      } else {
-          shared_primary->Close();
+          promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kPrimary});
       }
+      *primary_done = true;
   });
+
+  std::thread hedge_thread;
+  auto hedge_done = std::make_shared<std::atomic<bool>>(false);
+  bool hedge_spawned = false;
 
   // Wait for the primary to finish or timeout
   if (future.wait_for(target_delay) == std::future_status::timeout) {
       auto shared_hedge = std::shared_ptr<ObjectReadSource>(child_factory_().release(), NoOpDeleter{});
       
-      // Submit hedge task to thread pool
-      hedge_manager_->SubmitTask([shared_hedge, n, start_time, promise, resolved]() {
-          std::vector<char> local_buf(n);
-          if (!shared_hedge) {
-             return; 
-          }
-          auto res = shared_hedge->Read(local_buf.data(), n);
-          auto end_time = std::chrono::steady_clock::now();
-          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-          
-          bool expected = false;
-          if (resolved->compare_exchange_strong(expected, true)) {
-              std::unique_ptr<ObjectReadSource> winner_ptr(shared_hedge.get());
-              promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration});
-          } else {
-              shared_hedge->Close();
-          }
-      });
+      if (shared_hedge.get()) {
+          hedge_spawned = true;
+          // Spawn hedge thread
+          hedge_thread = std::thread([shared_hedge, n, start_time, promise, resolved, hedge_done]() {
+              std::vector<char> local_buf(n);
+              auto res = shared_hedge->Read(local_buf.data(), n);
+              auto end_time = std::chrono::steady_clock::now();
+              auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+              
+              bool expected = false;
+              if (resolved->compare_exchange_strong(expected, true)) {
+                  std::unique_ptr<ObjectReadSource> winner_ptr(shared_hedge.get());
+                  promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kHedge});
+              }
+              *hedge_done = true;
+          });
+      }
   }
 
+  // Block the main user thread only until a winner emerges.
   auto final_result = future.get();
+
+  if (final_result.winner_type == SourceType::kPrimary) {
+      // Primary won. Safe to join immediately.
+      primary_thread.join();
+      // Orphan the hedge if it was spawned but lost.
+      if (hedge_spawned && hedge_thread.joinable()) {
+          hedge_manager_->RegisterOrphan(std::move(hedge_thread), hedge_done);
+      }
+  } else {
+      // Hedge won. Safe to join immediately.
+      hedge_thread.join();
+      // Orphan the stalled primary so we don't block the user.
+      if (primary_thread.joinable()) {
+          hedge_manager_->RegisterOrphan(std::move(primary_thread), primary_done);
+      }
+  }
   
   if (final_result.result.ok()) {
       hedge_manager_->RecordLatency(n, final_result.duration);

@@ -21,9 +21,8 @@
 #include <mutex>
 #include <vector>
 #include <thread>
-#include <queue>
-#include <functional>
-#include <condition_variable>
+#include <atomic>
+#include <memory>
 
 namespace google {
 namespace cloud {
@@ -33,11 +32,11 @@ namespace internal {
 
 /**
  * Tracks the rolling p95 latency for GCS Object reads categorized by size bucket.
- * Also owns a lightweight thread pool to safely execute and reap orphaned hedged requests.
+ * Also owns a thread registry ("trash bin") to safely reap orphaned hedged requests.
  */
 class DynamicHedgeThresholdManager {
  public:
-  explicit DynamicHedgeThresholdManager(std::size_t num_threads = 4);
+  DynamicHedgeThresholdManager() = default;
   ~DynamicHedgeThresholdManager();
 
   // Records a successful read latency for a given byte size.
@@ -48,8 +47,9 @@ class DynamicHedgeThresholdManager {
       std::size_t size, double multiplier,
       std::chrono::milliseconds min_delay);
 
-  // Submits a background read task to the pool.
-  void SubmitTask(std::function<void()> task);
+  // Registers a stalled background thread so it can be reaped when it eventually finishes,
+  // preventing user thread blocking and thread leaks.
+  void RegisterOrphan(std::thread t, std::shared_ptr<std::atomic<bool>> is_done);
 
  private:
   struct SizeBucket {
@@ -67,12 +67,13 @@ class DynamicHedgeThresholdManager {
   static constexpr std::size_t kMaxSamples = 100;
   static constexpr std::size_t kMinSamplesForP95 = 10;
 
-  // Thread pool members
-  std::vector<std::thread> workers_;
-  std::queue<std::function<void()>> tasks_;
-  std::mutex pool_mu_;
-  std::condition_variable condition_;
-  bool stop_ = false;
+  // Orphan thread registry
+  struct Orphan {
+      std::thread t;
+      std::shared_ptr<std::atomic<bool>> is_done;
+  };
+  std::mutex orphans_mu_;
+  std::vector<Orphan> orphans_;
 };
 
 }  // namespace internal
