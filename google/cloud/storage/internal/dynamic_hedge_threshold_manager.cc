@@ -15,6 +15,7 @@
 #include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 
 namespace google {
 namespace cloud {
@@ -136,6 +137,24 @@ std::chrono::milliseconds DynamicHedgeThresholdManager::CalculateHedgeDelay(
       std::chrono::duration<double, std::milli>(p95_latency.count() * multiplier));
 
   return std::max(target_delay, min_delay);
+}
+
+void DynamicHedgeThresholdManager::DumpLatencies(std::string const& filename) const {
+  std::ofstream out(filename, std::ios_base::app);
+  if (!out) return;
+  
+  for (std::size_t i = 0; i < kNumBuckets; ++i) {
+      auto& bucket = const_cast<SizeBucket&>(buckets_[i]);
+      std::lock_guard<std::mutex> lk(bucket.mu);
+      if (bucket.samples.empty()) continue;
+      
+      out << i << ",";
+      for (std::size_t j = 0; j < bucket.samples.size(); ++j) {
+          out << bucket.samples[j].count();
+          if (j < bucket.samples.size() - 1) out << ";";
+      }
+      out << "\n";
+  }
 }
 
 }  // namespace internal
