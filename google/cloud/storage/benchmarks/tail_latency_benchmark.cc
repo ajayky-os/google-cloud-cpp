@@ -74,6 +74,7 @@ int main(int argc, char* argv[]) {
   long long read_size_bytes = (argc >= 6) ? std::stoll(argv[5]) : (1024 * 1024); // default 1MB
 
   auto options = google::cloud::Options{}
+    .set<google::cloud::storage_experimental::EnableReadHedgingOption>(true)
     .set<gcs::ConnectionPoolSizeOption>(concurrency);
   auto client = gcs::Client(options);
 
