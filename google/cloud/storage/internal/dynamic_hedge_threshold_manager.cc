@@ -92,6 +92,19 @@ void DynamicHedgeThresholdManager::RecordLatency(std::size_t size, std::chrono::
   bucket.index = (bucket.index + 1) % kMaxSamples;
 }
 
+void DynamicHedgeThresholdManager::RecordHedgeResult(bool hedge_won) {
+  if (hedge_won) {
+    hedge_wins_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    primary_wins_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+std::pair<std::uint64_t, std::uint64_t> DynamicHedgeThresholdManager::GetHedgeMetrics() const {
+  return {primary_wins_.load(std::memory_order_relaxed), 
+          hedge_wins_.load(std::memory_order_relaxed)};
+}
+
 std::chrono::milliseconds DynamicHedgeThresholdManager::CalculateHedgeDelay(
     std::size_t size, double multiplier, std::chrono::milliseconds min_delay) {
   auto& bucket = GetBucket(size);

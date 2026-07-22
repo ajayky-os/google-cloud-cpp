@@ -41,6 +41,9 @@ class DynamicHedgeThresholdManager {
 
   // Records a successful read latency for a given byte size.
   void RecordLatency(std::size_t size, std::chrono::milliseconds latency);
+  // Metrics tracking
+  void RecordHedgeResult(bool hedge_won);
+  std::pair<std::uint64_t, std::uint64_t> GetHedgeMetrics() const; // Returns {primary_wins, hedge_wins}
 
   // Calculates the hedge delay based on the rolling p95 of the size bucket.
   std::chrono::milliseconds CalculateHedgeDelay(
@@ -72,6 +75,8 @@ class DynamicHedgeThresholdManager {
       std::thread t;
       std::shared_ptr<std::atomic<bool>> is_done;
   };
+  std::atomic<std::uint64_t> primary_wins_{0};
+  std::atomic<std::uint64_t> hedge_wins_{0};
   std::mutex orphans_mu_;
   std::vector<Orphan> orphans_;
 };

@@ -151,6 +151,9 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       }
   }
   
+  if (hedge_spawned) {
+      hedge_manager_->RecordHedgeResult(final_result.winner_type == SourceType::kHedge);
+  }
   if (final_result.result.ok()) {
       hedge_manager_->RecordLatency(n, final_result.duration);
   }
