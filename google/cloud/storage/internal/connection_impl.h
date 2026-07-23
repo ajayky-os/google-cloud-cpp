@@ -175,6 +175,7 @@ class StorageConnectionImpl
   std::vector<std::string> InspectStackStructure() const override;
 
  private:
+  std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager() const override { return hedge_manager_; }
   std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager_;
   explicit StorageConnectionImpl(
       std::unique_ptr<storage_internal::GenericStub> stub, Options options);

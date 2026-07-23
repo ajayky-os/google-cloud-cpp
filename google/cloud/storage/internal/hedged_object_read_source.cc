@@ -18,7 +18,6 @@
 #include <future>
 #include <cstring>
 #include <atomic>
-#include <fstream>
 
 namespace google {
 namespace cloud {
@@ -44,6 +43,7 @@ HedgedObjectReadSource::HedgedObjectReadSource(
 
 bool HedgedObjectReadSource::IsOpen() const {
   if (active_child_) return active_child_->IsOpen();
+  // If we haven't opened it yet, consider it logically open.
   return true;
 }
 
@@ -62,21 +62,19 @@ struct RaceResult {
     SourceType winner_type;
 };
 
-// A custom deleter for the shared_ptr to prevent it from deleting the
-// ObjectReadSource since we extract it back into a unique_ptr.
 struct NoOpDeleter {
   void operator()(ObjectReadSource*) const {}
 };
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n) {
-  if (!active_child_) {
-      active_child_ = child_factory_();
-      if (!active_child_) {
-          return google::cloud::internal::UnknownError("Failed to initialize active stream", GCP_ERROR_INFO());
-      }
-  }
-
+  // If hedging is disabled or max hedges is 0, fallback to standard synchronous initialization.
   if (!enable_hedging_ || max_hedges_ <= 0) {
+      if (!active_child_) {
+          active_child_ = child_factory_();
+          if (!active_child_) {
+              return google::cloud::internal::UnknownError("Failed to initialize active stream", GCP_ERROR_INFO());
+          }
+      }
       return active_child_->Read(buf, n);
   }
 
@@ -88,65 +86,86 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
   
   auto start_time = std::chrono::steady_clock::now();
 
-  auto shared_primary = std::shared_ptr<ObjectReadSource>(active_child_.release(), NoOpDeleter{});
+  std::thread primary_thread;
   auto primary_done = std::make_shared<std::atomic<bool>>(false);
 
-  // Spawn primary thread
-  std::thread primary_thread([shared_primary, n, start_time, promise, resolved, primary_done]() {
-      std::vector<char> local_buf(n);
-      auto res = shared_primary->Read(local_buf.data(), n);
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-      
-      bool expected = false;
-      if (resolved->compare_exchange_strong(expected, true)) {
-          std::unique_ptr<ObjectReadSource> winner_ptr(shared_primary.get());
-          promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kPrimary});
-      }
-      *primary_done = true;
-  });
+  if (active_child_) {
+      // Stream is already open (middle of a streaming transfer).
+      auto shared_primary = std::shared_ptr<ObjectReadSource>(active_child_.release(), NoOpDeleter{});
+      primary_thread = std::thread([shared_primary, n, start_time, promise, resolved, primary_done]() {
+          std::vector<char> local_buf(n);
+          auto res = shared_primary->Read(local_buf.data(), n);
+          auto end_time = std::chrono::steady_clock::now();
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+          
+          bool expected = false;
+          if (resolved->compare_exchange_strong(expected, true)) {
+              std::unique_ptr<ObjectReadSource> winner_ptr(shared_primary.get());
+              promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kPrimary});
+          }
+          *primary_done = true;
+      });
+  } else {
+      // Stream is NOT open yet. The Open call (factory) will happen inside the primary thread!
+      primary_thread = std::thread([this, n, start_time, promise, resolved, primary_done]() {
+          auto local_primary = child_factory_();
+          if (!local_primary) {
+             *primary_done = true;
+             return;
+          }
+          std::vector<char> local_buf(n);
+          auto res = local_primary->Read(local_buf.data(), n);
+          auto end_time = std::chrono::steady_clock::now();
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+          
+          bool expected = false;
+          if (resolved->compare_exchange_strong(expected, true)) {
+              promise->set_value(RaceResult{std::move(res), std::move(local_primary), std::move(local_buf), duration, SourceType::kPrimary});
+          } else {
+              local_primary->Close();
+          }
+          *primary_done = true;
+      });
+  }
 
   std::thread hedge_thread;
   auto hedge_done = std::make_shared<std::atomic<bool>>(false);
   bool hedge_spawned = false;
 
-  // Wait for the primary to finish or timeout
   if (future.wait_for(target_delay) == std::future_status::timeout) {
-      auto shared_hedge = std::shared_ptr<ObjectReadSource>(child_factory_().release(), NoOpDeleter{});
+      hedge_spawned = true;
       
-      if (shared_hedge.get()) {
-          hedge_spawned = true;
-          // Spawn hedge thread
-          hedge_thread = std::thread([shared_hedge, n, start_time, promise, resolved, hedge_done]() {
-              std::vector<char> local_buf(n);
-              auto res = shared_hedge->Read(local_buf.data(), n);
-              auto end_time = std::chrono::steady_clock::now();
-              auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-              
-              bool expected = false;
-              if (resolved->compare_exchange_strong(expected, true)) {
-                  std::unique_ptr<ObjectReadSource> winner_ptr(shared_hedge.get());
-                  promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kHedge});
-              }
-              *hedge_done = true;
-          });
-      }
+      // Spawn hedge thread that also executes the factory if needed
+      hedge_thread = std::thread([this, n, start_time, promise, resolved, hedge_done]() {
+          auto hedge_source = child_factory_();
+          std::vector<char> local_buf(n);
+          if (!hedge_source) {
+             *hedge_done = true;
+             return; 
+          }
+          auto res = hedge_source->Read(local_buf.data(), n);
+          auto end_time = std::chrono::steady_clock::now();
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+          
+          bool expected = false;
+          if (resolved->compare_exchange_strong(expected, true)) {
+              promise->set_value(RaceResult{std::move(res), std::move(hedge_source), std::move(local_buf), duration, SourceType::kHedge});
+          } else {
+              hedge_source->Close();
+          }
+          *hedge_done = true;
+      });
   }
 
-  // Block the main user thread only until a winner emerges.
   auto final_result = future.get();
 
   if (final_result.winner_type == SourceType::kPrimary) {
-      // Primary won. Safe to join immediately.
       primary_thread.join();
-      // Orphan the hedge if it was spawned but lost.
       if (hedge_spawned && hedge_thread.joinable()) {
           hedge_manager_->RegisterOrphan(std::move(hedge_thread), hedge_done);
       }
   } else {
-      // Hedge won. Safe to join immediately.
       hedge_thread.join();
-      // Orphan the stalled primary so we don't block the user.
       if (primary_thread.joinable()) {
           hedge_manager_->RegisterOrphan(std::move(primary_thread), primary_done);
       }
@@ -154,12 +173,8 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
   
   if (hedge_spawned) {
       hedge_manager_->RecordHedgeResult(final_result.winner_type == SourceType::kHedge);
-      std::string filename = std::string("/home/ajayky_google_com/projects/google-cloud-cpp/hedge_metrics_") + std::to_string(multiplier_) + ".csv";
-      std::ofstream log_file(filename, std::ios_base::app);
-      if (log_file) {
-          log_file << (final_result.winner_type == SourceType::kHedge ? "1" : "0") << "," << final_result.duration.count() << "\n";
-      }
   }
+  
   if (final_result.result.ok()) {
       hedge_manager_->RecordLatency(n, final_result.duration);
   }

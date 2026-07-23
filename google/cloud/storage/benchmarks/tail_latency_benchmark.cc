@@ -172,6 +172,12 @@ int main(int argc, char* argv[]) {
   if (client.connection()->hedge_manager()) {
     std::string filename = std::string("/home/ajayky_google_com/projects/google-cloud-cpp/dynamic_hedge_latencies_") + std::to_string(multiplier) + ".csv";
     client.connection()->hedge_manager()->DumpLatencies(filename);
+    auto metrics = client.connection()->hedge_manager()->GetHedgeMetrics();
+    std::ofstream out_metrics(std::string("/home/ajayky_google_com/projects/google-cloud-cpp/hedge_metrics_") + std::to_string(multiplier) + ".csv");
+    if (out_metrics) {
+        out_metrics << "primary_wins,hedge_wins\n";
+        out_metrics << metrics.first << "," << metrics.second << "\n";
+    }
   }
 
   return 0;
