@@ -106,6 +106,7 @@ std::pair<std::uint64_t, std::uint64_t> DynamicHedgeThresholdManager::GetHedgeMe
           hedge_wins_.load(std::memory_order_relaxed)};
 }
 
+
 std::chrono::milliseconds DynamicHedgeThresholdManager::CalculateHedgeDelay(
     std::size_t size, double multiplier, std::chrono::milliseconds min_delay) {
   auto& bucket = GetBucket(size);

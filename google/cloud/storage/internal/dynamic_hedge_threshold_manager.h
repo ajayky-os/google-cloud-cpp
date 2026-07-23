@@ -46,6 +46,7 @@ class DynamicHedgeThresholdManager {
   void RecordHedgeResult(bool hedge_won);
   std::pair<std::uint64_t, std::uint64_t> GetHedgeMetrics() const;
   void DumpLatencies(std::string const& filename) const;
+  void DumpLatencies() const;
 
   // Calculates the hedge delay based on the rolling p95 of the size bucket.
   std::chrono::milliseconds CalculateHedgeDelay(

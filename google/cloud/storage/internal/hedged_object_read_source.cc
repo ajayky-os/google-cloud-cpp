@@ -154,6 +154,11 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
   
   if (hedge_spawned) {
       hedge_manager_->RecordHedgeResult(final_result.winner_type == SourceType::kHedge);
+      std::string filename = std::string("/home/ajayky_google_com/projects/google-cloud-cpp/hedge_metrics_") + std::to_string(multiplier_) + ".csv";
+      std::ofstream log_file(filename, std::ios_base::app);
+      if (log_file) {
+          log_file << (final_result.winner_type == SourceType::kHedge ? "1" : "0") << "," << final_result.duration.count() << "\n";
+      }
   }
   if (final_result.result.ok()) {
       hedge_manager_->RecordLatency(n, final_result.duration);

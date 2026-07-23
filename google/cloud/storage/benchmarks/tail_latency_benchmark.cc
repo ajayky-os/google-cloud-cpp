@@ -15,7 +15,9 @@ namespace gcs = ::google::cloud::storage;
 
 struct LatencyRecord {
   std::chrono::system_clock::time_point timestamp;
-  std::chrono::microseconds duration;
+  std::chrono::microseconds open_duration;
+  std::chrono::microseconds read_duration;
+  std::chrono::microseconds total_duration;
 };
 
 void PrintStats(std::vector<LatencyRecord>& records) {
@@ -27,7 +29,7 @@ void PrintStats(std::vector<LatencyRecord>& records) {
   std::vector<std::chrono::microseconds> latencies;
   latencies.reserve(records.size());
   for (const auto& r : records) {
-    latencies.push_back(r.duration);
+    latencies.push_back(r.total_duration);
   }
   std::sort(latencies.begin(), latencies.end());
 
@@ -37,7 +39,7 @@ void PrintStats(std::vector<LatencyRecord>& records) {
     return latencies[idx].count() / 1000.0;
   };
 
-  std::cout << "\n--- Latency Statistics (ms) ---\n";
+  std::cout << "\n--- Total Latency Statistics (ms) ---\n";
   std::cout << "Count: " << latencies.size() << "\n";
   std::cout << "Min:   " << latencies.front().count() / 1000.0 << " ms\n";
   std::cout << "p50:   " << get_percentile(0.50) << " ms\n";
@@ -53,28 +55,35 @@ void WriteCsv(const std::string& filename, const std::vector<LatencyRecord>& rec
     std::cerr << "Error: Could not open " << filename << " for writing CSV.\n";
     return;
   }
-  out << "Timestamp_ms,Latency_ms\n";
+  out << "Timestamp_ms,Open_ms,Read_ms,Total_ms\n";
   for (const auto& r : records) {
     auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(r.timestamp.time_since_epoch()).count();
-    out << ts_ms << "," << (r.duration.count() / 1000.0) << "\n";
+    out << ts_ms << "," 
+        << (r.open_duration.count() / 1000.0) << ","
+        << (r.read_duration.count() / 1000.0) << ","
+        << (r.total_duration.count() / 1000.0) << "\n";
   }
   std::cout << "\nRaw latencies written to " << filename << "\n";
 }
 
 int main(int argc, char* argv[]) {
   if (argc < 4) {
-    std::cerr << "Usage: " << argv[0] << " <bucket_name> <object_name> <duration_minutes> [concurrency] [read_size_bytes]\n";
+    std::cerr << "Usage: " << argv[0] << " <bucket_name> <object_name> <duration_minutes> [concurrency] [read_size_bytes] [csv_output] [enable_hedging] [multiplier]\n";
     return 1;
   }
 
   std::string bucket_name = argv[1];
   std::string object_name = argv[2];
   int duration_minutes = std::stoi(argv[3]);
-  int concurrency = (argc >= 5) ? std::stoi(argv[4]) : 100;
-  long long read_size_bytes = (argc >= 6) ? std::stoll(argv[5]) : (1024 * 1024); // default 1MB
+  int concurrency = (argc >= 5) ? std::stoi(argv[4]) : 30;
+  long long read_size_bytes = (argc >= 6) ? std::stoll(argv[5]) : (1024 * 1024);
+  std::string csv_filename = (argc >= 7) ? argv[6] : "raw_latencies.csv";
+  bool enable_hedging = (argc >= 8) ? (std::stoi(argv[7]) != 0) : true;
+  double multiplier = (argc >= 9) ? std::stod(argv[8]) : 1.5;
 
   auto options = google::cloud::Options{}
-    .set<google::cloud::storage_experimental::EnableReadHedgingOption>(true)
+    .set<google::cloud::storage_experimental::EnableReadHedgingOption>(enable_hedging)
+    .set<google::cloud::storage_experimental::DynamicHedgeMultiplierOption>(multiplier)
     .set<gcs::ConnectionPoolSizeOption>(concurrency);
   auto client = gcs::Client(options);
 
@@ -85,10 +94,10 @@ int main(int argc, char* argv[]) {
   std::cout << "Starting benchmark for gs://" << bucket_name << "/" << object_name << "\n";
   std::cout << "Target Duration: " << duration_minutes << " minutes\n";
   std::cout << "Concurrency: " << concurrency << " workers\n";
-  if (read_size_bytes > 0) {
-     std::cout << "Read Size: " << read_size_bytes << " bytes per request\n";
-  } else {
-     std::cout << "Read Size: Full Object\n";
+  std::cout << "Read Size: " << (read_size_bytes > 0 ? std::to_string(read_size_bytes) : "Full Object") << "\n";
+  std::cout << "Hedging Enabled: " << (enable_hedging ? "Yes" : "No") << "\n";
+  if (enable_hedging) {
+      std::cout << "Hedge Multiplier: " << multiplier << "x\n";
   }
 
   auto test_start = std::chrono::steady_clock::now();
@@ -115,6 +124,8 @@ int main(int argc, char* argv[]) {
       } else {
           stream = client.ReadObject(bucket_name, object_name);
       }
+      
+      auto end_open = std::chrono::steady_clock::now();
 
       if (!stream) {
         continue;
@@ -126,9 +137,13 @@ int main(int argc, char* argv[]) {
         continue;
       }
 
-      auto end = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-      local_records.push_back({start_system, duration});
+      auto end_read = std::chrono::steady_clock::now();
+      
+      auto open_dur = std::chrono::duration_cast<std::chrono::microseconds>(end_open - start);
+      auto read_dur = std::chrono::duration_cast<std::chrono::microseconds>(end_read - end_open);
+      auto total_dur = std::chrono::duration_cast<std::chrono::microseconds>(end_read - start);
+      
+      local_records.push_back({start_system, open_dur, read_dur, total_dur});
 
       int current_total = ++total_iterations;
       if (current_total % 1000 == 0) {
@@ -152,7 +167,12 @@ int main(int argc, char* argv[]) {
 
   std::cout << "\nTest completed after " << duration_minutes << " minutes.\n";
   PrintStats(all_records);
-  WriteCsv("tail_latency_concurrent.csv", all_records);
+  WriteCsv(csv_filename, all_records);
+
+  if (client.connection()->hedge_manager()) {
+    std::string filename = std::string("/home/ajayky_google_com/projects/google-cloud-cpp/dynamic_hedge_latencies_") + std::to_string(multiplier) + ".csv";
+    client.connection()->hedge_manager()->DumpLatencies(filename);
+  }
 
   return 0;
 }
