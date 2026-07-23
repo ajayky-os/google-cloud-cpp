@@ -589,7 +589,7 @@ Options DefaultOptions(Options opts) {
     o.set<storage_experimental::HedgingStrategyOption>(storage_experimental::HedgingStrategy::kDynamic);
   }
   if (!o.has<storage_experimental::ReadHedgeDelayOption>()) {
-    o.set<storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(500));
+    o.set<storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(300));
   }
   if (!o.has<storage_experimental::DynamicHedgeMultiplierOption>()) {
     o.set<storage_experimental::DynamicHedgeMultiplierOption>(1.5);

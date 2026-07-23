@@ -124,18 +124,18 @@ std::chrono::milliseconds DynamicHedgeThresholdManager::CalculateHedgeDelay(
   std::sort(local_samples.begin(), local_samples.end());
   
   // Calculate p95
-  double p = 0.95;
+  double p = 0.99;
   double index = p * (local_samples.size() - 1);
   std::size_t lower = static_cast<std::size_t>(std::floor(index));
   std::size_t upper = static_cast<std::size_t>(std::ceil(index));
   double weight = index - lower;
 
-  auto p95_latency = local_samples[lower] + 
+  auto p99_latency = local_samples[lower] + 
       std::chrono::duration_cast<std::chrono::milliseconds>(
           (local_samples[upper] - local_samples[lower]) * weight);
 
   auto target_delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::duration<double, std::milli>(p95_latency.count() * multiplier));
+      std::chrono::duration<double, std::milli>(p99_latency.count() * multiplier));
 
   return std::max(target_delay, min_delay);
 }

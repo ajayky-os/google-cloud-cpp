@@ -84,6 +84,7 @@ int main(int argc, char* argv[]) {
   auto options = google::cloud::Options{}
     .set<google::cloud::storage_experimental::EnableReadHedgingOption>(enable_hedging)
     .set<google::cloud::storage_experimental::DynamicHedgeMultiplierOption>(multiplier)
+    .set<google::cloud::storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(300))
     .set<gcs::ConnectionPoolSizeOption>(concurrency);
   auto client = gcs::Client(options);
 
