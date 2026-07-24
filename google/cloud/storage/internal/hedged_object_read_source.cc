@@ -107,8 +107,8 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       });
   } else {
       // Stream is NOT open yet. The Open call (factory) will happen inside the primary thread!
-      primary_thread = std::thread([this, n, start_time, promise, resolved, primary_done]() {
-          auto local_primary = child_factory_();
+      primary_thread = std::thread([factory = child_factory_, n, start_time, promise, resolved, primary_done]() {
+          auto local_primary = factory();
           if (!local_primary) {
              *primary_done = true;
              return;
@@ -136,8 +136,8 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       hedge_spawned = true;
       
       // Spawn hedge thread that also executes the factory if needed
-      hedge_thread = std::thread([this, n, start_time, promise, resolved, hedge_done]() {
-          auto hedge_source = child_factory_();
+      hedge_thread = std::thread([factory = child_factory_, n, start_time, promise, resolved, hedge_done]() {
+          auto hedge_source = factory();
           std::vector<char> local_buf(n);
           if (!hedge_source) {
              *hedge_done = true;
