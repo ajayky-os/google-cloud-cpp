@@ -30,6 +30,13 @@ namespace storage {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
+struct HedgeMetrics {
+  std::uint64_t open_primary_wins = 0;
+  std::uint64_t open_hedge_wins = 0;
+  std::uint64_t read_primary_wins = 0;
+  std::uint64_t read_hedge_wins = 0;
+};
+
 /**
  * Tracks the rolling p95 latency for GCS Object reads categorized by size bucket.
  * Also owns a thread registry ("trash bin") to safely reap orphaned hedged requests.
@@ -43,8 +50,8 @@ class DynamicHedgeThresholdManager {
   void RecordLatency(std::size_t size, std::chrono::milliseconds latency);
   
   // Metrics tracking
-  void RecordHedgeResult(bool hedge_won);
-  std::pair<std::uint64_t, std::uint64_t> GetHedgeMetrics() const;
+  void RecordHedgeResult(bool is_open_phase, bool hedge_won);
+  HedgeMetrics GetHedgeMetrics() const;
   void DumpLatencies(std::string const& filename) const;
   void DumpLatencies() const;
 
@@ -81,8 +88,10 @@ class DynamicHedgeThresholdManager {
   std::mutex orphans_mu_;
   std::vector<Orphan> orphans_;
   
-  std::atomic<std::uint64_t> primary_wins_{0};
-  std::atomic<std::uint64_t> hedge_wins_{0};
+  std::atomic<std::uint64_t> open_primary_wins_{0};
+  std::atomic<std::uint64_t> open_hedge_wins_{0};
+  std::atomic<std::uint64_t> read_primary_wins_{0};
+  std::atomic<std::uint64_t> read_hedge_wins_{0};
 };
 
 }  // namespace internal

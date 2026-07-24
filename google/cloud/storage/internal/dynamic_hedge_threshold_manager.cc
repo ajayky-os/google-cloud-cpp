@@ -93,17 +93,29 @@ void DynamicHedgeThresholdManager::RecordLatency(std::size_t size, std::chrono::
   bucket.index = (bucket.index + 1) % kMaxSamples;
 }
 
-void DynamicHedgeThresholdManager::RecordHedgeResult(bool hedge_won) {
-  if (hedge_won) {
-    hedge_wins_.fetch_add(1, std::memory_order_relaxed);
+void DynamicHedgeThresholdManager::RecordHedgeResult(bool is_open_phase, bool hedge_won) {
+  if (is_open_phase) {
+    if (hedge_won) {
+      open_hedge_wins_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      open_primary_wins_.fetch_add(1, std::memory_order_relaxed);
+    }
   } else {
-    primary_wins_.fetch_add(1, std::memory_order_relaxed);
+    if (hedge_won) {
+      read_hedge_wins_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      read_primary_wins_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 }
 
-std::pair<std::uint64_t, std::uint64_t> DynamicHedgeThresholdManager::GetHedgeMetrics() const {
-  return {primary_wins_.load(std::memory_order_relaxed), 
-          hedge_wins_.load(std::memory_order_relaxed)};
+HedgeMetrics DynamicHedgeThresholdManager::GetHedgeMetrics() const {
+  return HedgeMetrics{
+    open_primary_wins_.load(std::memory_order_relaxed),
+    open_hedge_wins_.load(std::memory_order_relaxed),
+    read_primary_wins_.load(std::memory_order_relaxed),
+    read_hedge_wins_.load(std::memory_order_relaxed)
+  };
 }
 
 

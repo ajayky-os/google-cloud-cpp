@@ -176,8 +176,8 @@ int main(int argc, char* argv[]) {
     auto metrics = client.connection()->hedge_manager()->GetHedgeMetrics();
     std::ofstream out_metrics(std::string("/home/ajayky_google_com/projects/google-cloud-cpp/hedge_metrics_") + std::to_string(multiplier) + ".csv");
     if (out_metrics) {
-        out_metrics << "primary_wins,hedge_wins\n";
-        out_metrics << metrics.first << "," << metrics.second << "\n";
+        out_metrics << "open_primary_wins,open_hedge_wins,read_primary_wins,read_hedge_wins\n";
+        out_metrics << metrics.open_primary_wins << "," << metrics.open_hedge_wins << "," << metrics.read_primary_wins << "," << metrics.read_hedge_wins << "\n";
     }
   }
 

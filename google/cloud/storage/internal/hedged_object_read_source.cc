@@ -67,6 +67,7 @@ struct NoOpDeleter {
 };
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n) {
+  bool is_open_phase = !active_child_;
   // If hedging is disabled or max hedges is 0, fallback to standard synchronous initialization.
   if (!enable_hedging_ || max_hedges_ <= 0) {
       if (!active_child_) {
@@ -172,7 +173,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
   }
   
   if (hedge_spawned) {
-      hedge_manager_->RecordHedgeResult(final_result.winner_type == SourceType::kHedge);
+      hedge_manager_->RecordHedgeResult(is_open_phase, final_result.winner_type == SourceType::kHedge);
   }
   
   if (final_result.result.ok()) {
