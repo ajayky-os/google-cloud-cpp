@@ -15,7 +15,7 @@
 #ifndef GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_HEDGED_OBJECT_READ_SOURCE_H
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_HEDGED_OBJECT_READ_SOURCE_H
 
-#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
+#include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/object_read_source.h"
 #include "google/cloud/storage/internal/object_requests.h"
 #include <chrono>
@@ -33,7 +33,7 @@ class HedgedObjectReadSource : public ObjectReadSource {
   using ChildFactory = std::function<std::unique_ptr<ObjectReadSource>()>;
 
   HedgedObjectReadSource(
-      std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager,
+      std::shared_ptr<HedgingThreadPool> hedge_pool,
       ReadObjectRangeRequest request,
       ChildFactory child_factory,
       bool enable_hedging,
@@ -48,7 +48,7 @@ class HedgedObjectReadSource : public ObjectReadSource {
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
 
  private:
-  std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager_;
+  std::shared_ptr<HedgingThreadPool> hedge_pool_;
   ReadObjectRangeRequest request_;
   ChildFactory child_factory_;
   

@@ -48,6 +48,26 @@ struct EnableReadHedgingOption {
 };
 
 /**
+ * The maximum allowed rate of hedges per second across the connection.
+ * Default: 0.0 (unlimited/no rate limit).
+ *
+ * @ingroup storage-options
+ */
+struct ReadHedgeRateLimitOption {
+  using Type = double;
+};
+
+/**
+ * The maximum allowed concurrent active background hedges running at any instant.
+ * Default: 0 (unlimited/no concurrency limit).
+ *
+ * @ingroup storage-options
+ */
+struct MaxConcurrentHedgesOption {
+  using Type = std::int64_t;
+};
+
+/**
  * The static delay before initiating a parallel hedge (used in kFixed strategy).
  * Default: 500 milliseconds.
  *
@@ -121,6 +141,19 @@ struct HttpVersionOption {
  */
 struct OTelSpanEnrichmentOption {
   using Type = bool;
+};
+
+/**
+ * Sets the TCP/TLS connection timeout.
+ *
+ * If the connection cannot be established within this time, the request is
+ * aborted. This is useful as a fail-safe against OS-level TCP locks during
+ * severe network routing anomalies.
+ *
+ * @ingroup storage-options
+ */
+struct HttpConnectTimeoutOption {
+  using Type = std::chrono::milliseconds;
 };
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
@@ -445,7 +478,7 @@ using ClientOptionList = ::google::cloud::OptionList<
     ConnectionPoolSizeOption, DownloadBufferSizeOption, UploadBufferSizeOption,
     EnableCurlSslLockingOption, EnableCurlSigpipeHandlerOption,
     MaximumCurlSocketRecvSizeOption, MaximumCurlSocketSendSizeOption,
-    TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
+    storage_experimental::HttpConnectTimeoutOption, TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
     IdempotencyPolicyOption, CARootsFilePathOption,
     UploadChecksumValidationOption, DownloadChecksumValidationOption,
     PrecomputedChecksumsOption, storage_experimental::HttpVersionOption,

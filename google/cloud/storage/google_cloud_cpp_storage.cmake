@@ -90,10 +90,9 @@ add_library(
     internal/connection_impl.h
     internal/const_buffer.cc
     internal/const_buffer.h
-    internal/dynamic_hedge_threshold_manager.cc
     internal/hedged_object_read_source.cc
     internal/crc32c.cc
-    internal/dynamic_hedge_threshold_manager.h
+    internal/hedging_thread_pool.h
     internal/hedged_object_read_source.h
     internal/crc32c.h
     internal/curl/request.h

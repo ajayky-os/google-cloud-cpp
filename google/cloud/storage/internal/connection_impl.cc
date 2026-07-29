@@ -156,7 +156,17 @@ std::shared_ptr<StorageConnectionImpl> StorageConnectionImpl::Create(
 StorageConnectionImpl::StorageConnectionImpl(
     std::unique_ptr<storage_internal::GenericStub> stub, Options options)
     : stub_(std::move(stub)),
-      options_(MergeOptions(std::move(options), stub_->options())), hedge_manager_(std::make_shared<DynamicHedgeThresholdManager>()) {}
+      options_(MergeOptions(std::move(options), stub_->options())) {
+  if (options_.get<storage_experimental::EnableReadHedgingOption>()) {
+    std::size_t pool_size = options_.get<ConnectionPoolSizeOption>();
+    if (pool_size == 0) pool_size = 4;
+    std::size_t max_threads = pool_size * 2;
+    double rate_limit = options_.get<storage_experimental::ReadHedgeRateLimitOption>();
+    double capacity = std::max(10.0, rate_limit);
+    std::int64_t max_concurrent = options_.get<storage_experimental::MaxConcurrentHedgesOption>();
+    hedge_pool_ = std::make_shared<HedgingThreadPool>(max_threads, rate_limit, capacity, max_concurrent);
+  }
+}
 
 Options StorageConnectionImpl::options() const { return options_; }
 
@@ -411,7 +421,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
 
   return std::unique_ptr<ObjectReadSource>(
       std::make_unique<HedgedObjectReadSource>(
-          hedge_manager_, request, std::move(retry_source_factory),
+          hedge_pool_, request, std::move(retry_source_factory),
           enable_hedging, multiplier, min_delay, max_hedges));
 }
 

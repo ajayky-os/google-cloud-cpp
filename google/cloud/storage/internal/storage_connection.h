@@ -32,7 +32,7 @@
 #include "google/cloud/storage/object_read_stream.h"
 #include "google/cloud/storage/service_account.h"
 #include "google/cloud/storage/version.h"
-#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
+#include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/options.h"
 #include "google/cloud/status.h"
 #include "google/cloud/status_or.h"
@@ -54,7 +54,7 @@ class ObjectReadStreambuf;
  */
 class StorageConnection {
  public:
-  virtual std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager() const { return nullptr; }
+  virtual std::shared_ptr<HedgingThreadPool> hedge_pool() const { return nullptr; }
  public:
   virtual ~StorageConnection() = default;
 

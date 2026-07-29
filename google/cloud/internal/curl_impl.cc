@@ -197,6 +197,10 @@ CurlImpl::CurlImpl(CurlHandle handle,
 
   http_version_ = options.get<HttpVersionOption>();
 
+  if (options.has<HttpConnectTimeoutOption>()) {
+    connect_timeout_ms_ = options.get<HttpConnectTimeoutOption>();
+  }
+
   transfer_stall_timeout_ = options.get<TransferStallTimeoutOption>();
   transfer_stall_minimum_rate_ = options.get<TransferStallMinimumRateOption>();
   download_stall_timeout_ = options.get<DownloadStallTimeoutOption>();
@@ -435,6 +439,13 @@ Status CurlImpl::MakeRequest(HttpMethod method, RestContext& context,
   if (method == HttpMethod::kGet) {
     status = handle_.SetOption(CURLOPT_NOPROGRESS, 1L);
     if (!status.ok()) return OnTransferError(context, std::move(status));
+    
+    if (connect_timeout_ms_ != std::chrono::milliseconds::zero()) {
+      auto const timeout_ms = static_cast<long>(connect_timeout_ms_.count());
+      status = handle_.SetOption(CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
+      if (!status.ok()) return OnTransferError(context, std::move(status));
+    }
+
     if (download_stall_timeout_ != std::chrono::seconds::zero()) {
       // NOLINTNEXTLINE(google-runtime-int) - libcurl *requires* long
       auto const timeout = static_cast<long>(download_stall_timeout_.count());

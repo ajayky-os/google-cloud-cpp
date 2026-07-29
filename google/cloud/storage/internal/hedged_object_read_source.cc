@@ -26,14 +26,14 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
 HedgedObjectReadSource::HedgedObjectReadSource(
-    std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager,
+    std::shared_ptr<HedgingThreadPool> hedge_pool,
     ReadObjectRangeRequest request,
     ChildFactory child_factory,
     bool enable_hedging,
     double multiplier,
     std::chrono::milliseconds min_delay,
     int max_hedges)
-    : hedge_manager_(std::move(hedge_manager)),
+    : hedge_pool_(std::move(hedge_pool)),
       request_(std::move(request)),
       child_factory_(std::move(child_factory)),
       enable_hedging_(enable_hedging),
@@ -43,7 +43,6 @@ HedgedObjectReadSource::HedgedObjectReadSource(
 
 bool HedgedObjectReadSource::IsOpen() const {
   if (active_child_) return active_child_->IsOpen();
-  // If we haven't opened it yet, consider it logically open.
   return true;
 }
 
@@ -68,8 +67,8 @@ struct NoOpDeleter {
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n) {
   bool is_open_phase = !active_child_;
-  // If hedging is disabled or max hedges is 0, fallback to standard synchronous initialization.
-  if (!enable_hedging_ || max_hedges_ <= 0) {
+
+  if (!enable_hedging_ || max_hedges_ <= 0 || !hedge_pool_) {
       if (!active_child_) {
           active_child_ = child_factory_();
           if (!active_child_) {
@@ -79,7 +78,8 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
       return active_child_->Read(buf, n);
   }
 
-  auto target_delay = hedge_manager_->CalculateHedgeDelay(n, multiplier_, min_delay_);
+  // Under the simplified model, we use the fixed delay safety floor (default: e.g. 500ms)
+  auto target_delay = min_delay_;
 
   auto promise = std::make_shared<std::promise<RaceResult>>();
   auto future = promise->get_future();
@@ -87,13 +87,9 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
   
   auto start_time = std::chrono::steady_clock::now();
 
-  std::thread primary_thread;
-  auto primary_done = std::make_shared<std::atomic<bool>>(false);
-
   if (active_child_) {
-      // Stream is already open (middle of a streaming transfer).
       auto shared_primary = std::shared_ptr<ObjectReadSource>(active_child_.release(), NoOpDeleter{});
-      primary_thread = std::thread([shared_primary, n, start_time, promise, resolved, primary_done]() {
+      hedge_pool_->Enqueue([shared_primary, n, start_time, promise, resolved]() {
           std::vector<char> local_buf(n);
           auto res = shared_primary->Read(local_buf.data(), n);
           auto end_time = std::chrono::steady_clock::now();
@@ -104,16 +100,11 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
               std::unique_ptr<ObjectReadSource> winner_ptr(shared_primary.get());
               promise->set_value(RaceResult{std::move(res), std::move(winner_ptr), std::move(local_buf), duration, SourceType::kPrimary});
           }
-          *primary_done = true;
       });
   } else {
-      // Stream is NOT open yet. The Open call (factory) will happen inside the primary thread!
-      primary_thread = std::thread([factory = child_factory_, n, start_time, promise, resolved, primary_done]() {
+      hedge_pool_->Enqueue([factory = child_factory_, n, start_time, promise, resolved]() {
           auto local_primary = factory();
-          if (!local_primary) {
-             *primary_done = true;
-             return;
-          }
+          if (!local_primary) return;
           std::vector<char> local_buf(n);
           auto res = local_primary->Read(local_buf.data(), n);
           auto end_time = std::chrono::steady_clock::now();
@@ -125,25 +116,24 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
           } else {
               local_primary->Close();
           }
-          *primary_done = true;
       });
   }
 
-  std::thread hedge_thread;
-  auto hedge_done = std::make_shared<std::atomic<bool>>(false);
   bool hedge_spawned = false;
 
   if (future.wait_for(target_delay) == std::future_status::timeout) {
-      hedge_spawned = true;
-      
-      // Spawn hedge thread that also executes the factory if needed
-      hedge_thread = std::thread([factory = child_factory_, n, start_time, promise, resolved, hedge_done]() {
+      if (hedge_pool_->TryAcquireHedgeToken()) {
+          hedge_spawned = true;
+          
+          hedge_pool_->Enqueue([factory = child_factory_, n, start_time, promise, resolved, pool = hedge_pool_]() {
+          struct ConcurrencyGuard {
+              std::shared_ptr<HedgingThreadPool> p;
+              ~ConcurrencyGuard() { if (p) p->ReleaseHedgeSlot(); }
+          } guard{pool};
+
           auto hedge_source = factory();
+          if (!hedge_source) return;
           std::vector<char> local_buf(n);
-          if (!hedge_source) {
-             *hedge_done = true;
-             return; 
-          }
           auto res = hedge_source->Read(local_buf.data(), n);
           auto end_time = std::chrono::steady_clock::now();
           auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -154,30 +144,14 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n
           } else {
               hedge_source->Close();
           }
-          *hedge_done = true;
       });
+      }
   }
 
   auto final_result = future.get();
 
-  if (final_result.winner_type == SourceType::kPrimary) {
-      primary_thread.join();
-      if (hedge_spawned && hedge_thread.joinable()) {
-          hedge_manager_->RegisterOrphan(std::move(hedge_thread), hedge_done);
-      }
-  } else {
-      hedge_thread.join();
-      if (primary_thread.joinable()) {
-          hedge_manager_->RegisterOrphan(std::move(primary_thread), primary_done);
-      }
-  }
-  
   if (hedge_spawned) {
-      hedge_manager_->RecordHedgeResult(is_open_phase, final_result.winner_type == SourceType::kHedge);
-  }
-  
-  if (final_result.result.ok()) {
-      hedge_manager_->RecordLatency(n, final_result.duration);
+      hedge_pool_->RecordHedgeResult(is_open_phase, final_result.winner_type == SourceType::kHedge);
   }
 
   active_child_ = std::move(final_result.winner_source);

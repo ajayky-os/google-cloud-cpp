@@ -57,6 +57,17 @@ struct TransferStallMinimumRateOption {
 };
 
 /**
+ * Sets the TCP/TLS connection timeout.
+ *
+ * If the connection cannot be established within this time, the request is
+ * aborted. This is useful as a fail-safe against OS-level TCP locks during
+ * severe network routing anomalies.
+ */
+struct HttpConnectTimeoutOption {
+  using Type = std::chrono::milliseconds;
+};
+
+/**
  * Sets the download stall timeout.
  *
  * If a download *stalls*, i.e., no bytes are received for a significant period,
@@ -101,7 +112,7 @@ struct TargetApiVersionOption {
 
 /// The complete list of options accepted by `CurlRestClient`
 using RestInternalOptionList = ::google::cloud::OptionList<
-    TransferStallTimeoutOption, TransferStallMinimumRateOption,
+    HttpConnectTimeoutOption, TransferStallTimeoutOption, TransferStallMinimumRateOption,
     DownloadStallTimeoutOption, DownloadStallMinimumRateOption,
     LongrunningEndpointOption, TargetApiVersionOption>;
 
