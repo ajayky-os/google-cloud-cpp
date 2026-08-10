@@ -146,6 +146,7 @@ class CurlImpl {
   CurlHandle::SocketOptions socket_options_;
   std::string user_agent_;
   std::string http_version_;
+  std::chrono::milliseconds connect_timeout_ms_{0};
   std::chrono::seconds transfer_stall_timeout_;
   std::uint32_t transfer_stall_minimum_rate_;
   std::chrono::seconds download_stall_timeout_;

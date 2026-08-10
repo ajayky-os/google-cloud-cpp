@@ -15,6 +15,7 @@
 #include "google/cloud/internal/disable_deprecation_warnings.inc"
 #include "google/cloud/storage/internal/connection_impl.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
+#include "google/cloud/storage/internal/hedged_object_read_source.h"
 #include "google/cloud/storage/parallel_upload.h"
 #include "google/cloud/internal/filesystem.h"
 #include "google/cloud/internal/opentelemetry.h"
@@ -155,7 +156,23 @@ std::shared_ptr<StorageConnectionImpl> StorageConnectionImpl::Create(
 StorageConnectionImpl::StorageConnectionImpl(
     std::unique_ptr<storage_internal::GenericStub> stub, Options options)
     : stub_(std::move(stub)),
-      options_(MergeOptions(std::move(options), stub_->options())) {}
+      options_(MergeOptions(std::move(options), stub_->options())) {
+  if (options_.get<storage_experimental::EnableReadHedgingOption>()) {
+    std::size_t pool_size = options_.get<ConnectionPoolSizeOption>();
+    if (pool_size == 0) {
+      // If pool size is 0, the REST layer uses unpooled connections (creating new ones per request).
+      // We fall back to a safe multiple of hardware concurrency so the hedge pool isn't starved.
+      std::size_t nthreads = std::thread::hardware_concurrency();
+      pool_size = (nthreads == 0) ? 4 : (nthreads * 4);
+    }
+    
+    std::size_t max_threads = pool_size * 2;
+    double rate_limit = options_.get<storage_experimental::ReadHedgeRateLimitOption>();
+    double capacity = std::max(10.0, rate_limit);
+    std::int64_t max_concurrent = options_.get<storage_experimental::MaxConcurrentHedgesOption>();
+    hedge_pool_ = std::make_shared<HedgingThreadPool>(max_threads, rate_limit, capacity, max_concurrent);
+  }
+}
 
 Options StorageConnectionImpl::options() const { return options_; }
 
@@ -392,15 +409,30 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
         *current, request, where);
   };
 
-  auto retry_policy = current->get<RetryPolicyOption>()->clone();
-  auto backoff_policy = current->get<BackoffPolicyOption>()->clone();
-  auto child = factory(request, *retry_policy, *backoff_policy);
-  if (!child) return child;
+  auto retry_source_factory = [factory, current, request]() -> StatusOr<std::unique_ptr<storage::internal::ObjectReadSource>> {
+    auto retry_policy = current->get<RetryPolicyOption>()->clone();
+    auto backoff_policy = current->get<BackoffPolicyOption>()->clone();
+    auto child = factory(request, *retry_policy, *backoff_policy);
+    if (!child) return child;
+    
+    return std::unique_ptr<storage::internal::ObjectReadSource>(
+        std::make_unique<RetryObjectReadSource>(
+            factory, current, request, *std::move(child),
+            std::move(retry_policy), std::move(backoff_policy)));
+  };
+
+  bool enable_hedging = options().get<storage_experimental::EnableReadHedgingOption>();
+  auto min_delay = options().get<storage_experimental::ReadHedgeDelayOption>();
+  int max_hedges = options().get<storage_experimental::MaxReadHedgesOption>();
+
+  if (!enable_hedging || max_hedges <= 0 || !hedge_pool_) {
+    return retry_source_factory();
+  }
 
   return std::unique_ptr<ObjectReadSource>(
-      std::make_unique<RetryObjectReadSource>(
-          std::move(factory), std::move(current), request, *std::move(child),
-          std::move(retry_policy), std::move(backoff_policy)));
+      std::make_unique<HedgedObjectReadSource>(
+          hedge_pool_, request, std::move(retry_source_factory),
+          min_delay, max_hedges));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(

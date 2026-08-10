@@ -281,6 +281,9 @@ Options DefaultOptionsWithCredentials(Options opts);
  */
 class Client {
  public:
+  std::shared_ptr<internal::StorageConnection> connection() const { return connection_; }
+ public:
+ public:
   /**
    * Build a new client.
    *

@@ -90,7 +90,10 @@ add_library(
     internal/connection_impl.h
     internal/const_buffer.cc
     internal/const_buffer.h
+    internal/hedged_object_read_source.cc
     internal/crc32c.cc
+    internal/hedging_thread_pool.h
+    internal/hedged_object_read_source.h
     internal/crc32c.h
     internal/curl/request.h
     internal/curl/request_builder.h
