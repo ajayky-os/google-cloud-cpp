@@ -581,18 +581,18 @@ Options DefaultOptions(Options opts) {
                                                                 "/iamapi");
   }
 
-
   if (!o.has<storage_experimental::EnableReadHedgingOption>()) {
     o.set<storage_experimental::EnableReadHedgingOption>(false);
   }
   if (!o.has<storage_experimental::ReadHedgeRateLimitOption>()) {
-    o.set<storage_experimental::ReadHedgeRateLimitOption>(5.0); // Unlimited by default
+    o.set<storage_experimental::ReadHedgeRateLimitOption>(0.0);
   }
   if (!o.has<storage_experimental::MaxConcurrentHedgesOption>()) {
-    o.set<storage_experimental::MaxConcurrentHedgesOption>(15); // Unlimited by default
+    o.set<storage_experimental::MaxConcurrentHedgesOption>(0);
   }
   if (!o.has<storage_experimental::ReadHedgeDelayOption>()) {
-    o.set<storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(500));
+    o.set<storage_experimental::ReadHedgeDelayOption>(
+        std::chrono::milliseconds(500));
   }
   if (!o.has<storage_experimental::MaxReadHedgesOption>()) {
     o.set<storage_experimental::MaxReadHedgesOption>(2);
@@ -620,11 +620,8 @@ Options DefaultOptions(Options opts) {
   // use the low-level initialization code in
   // google/cloud/internal/curl_wrappers.cc, these are always needed.
   namespace rest = ::google::cloud::rest_internal;
-  auto rest_defaults = Options{};
-  if (o.has<storage_experimental::HttpConnectTimeoutOption>()) {
-    rest_defaults.set<rest::HttpConnectTimeoutOption>(o.get<storage_experimental::HttpConnectTimeoutOption>());
-  }
-  rest_defaults.set<rest::DownloadStallTimeoutOption>(
+  auto rest_defaults = Options{}
+                           .set<rest::DownloadStallTimeoutOption>(
                                o.get<DownloadStallTimeoutOption>())
                            .set<rest::DownloadStallMinimumRateOption>(
                                o.get<DownloadStallMinimumRateOption>())
@@ -651,6 +648,12 @@ Options DefaultOptions(Options opts) {
   }
   if (o.has<internal::CAPathOption>()) {
     rest_defaults.set<rest::CAPathOption>(o.get<internal::CAPathOption>());
+  }
+
+  // The (experimental) connect timeout is mapped the same way.
+  if (o.has<storage_experimental::HttpConnectTimeoutOption>()) {
+    rest_defaults.set<rest::HttpConnectTimeoutOption>(
+        o.get<storage_experimental::HttpConnectTimeoutOption>());
   }
 
   return google::cloud::internal::MergeOptions(std::move(o),

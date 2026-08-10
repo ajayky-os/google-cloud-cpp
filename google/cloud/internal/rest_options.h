@@ -112,9 +112,10 @@ struct TargetApiVersionOption {
 
 /// The complete list of options accepted by `CurlRestClient`
 using RestInternalOptionList = ::google::cloud::OptionList<
-    HttpConnectTimeoutOption, TransferStallTimeoutOption, TransferStallMinimumRateOption,
-    DownloadStallTimeoutOption, DownloadStallMinimumRateOption,
-    LongrunningEndpointOption, TargetApiVersionOption>;
+    HttpConnectTimeoutOption, TransferStallTimeoutOption,
+    TransferStallMinimumRateOption, DownloadStallTimeoutOption,
+    DownloadStallMinimumRateOption, LongrunningEndpointOption,
+    TargetApiVersionOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace rest_internal

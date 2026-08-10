@@ -16,15 +16,17 @@
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_HEDGING_THREAD_POOL_H
 
 #include "google/cloud/storage/version.h"
-#include <vector>
-#include <queue>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <functional>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <algorithm>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -33,52 +35,76 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
 /**
- * A lazy, dynamically-scaling thread pool with integrated Concurrency & QPS Rate Limiters.
- * Starts with 0 threads, and spawns worker threads on-demand up to max_threads.
- * Enforces dual throttle gates: max concurrent active hedges, and maximum spawned hedges per second.
+ * A lazy, dynamically-scaling thread pool with integrated hedge throttling.
+ *
+ * The pool starts with no threads and spawns workers on demand, up to
+ * @p max_threads. Hedged requests are gated by `TryAcquireHedgeToken()`,
+ * which enforces two limits: a maximum number of concurrently active hedges,
+ * and a maximum rate of new hedges per second (a token bucket).
  */
 class HedgingThreadPool {
  public:
-  explicit HedgingThreadPool(std::size_t max_threads, double rate_limit, double capacity, std::int64_t max_concurrent)
-      : max_threads_(max_threads), idle_threads_(0), stop_(false),
-        rate_limit_(rate_limit), tokens_capacity_(capacity), tokens_(capacity),
+  HedgingThreadPool(std::size_t max_threads, double rate_limit, double capacity,
+                    std::int64_t max_concurrent)
+      : max_threads_(max_threads),
+        rate_limit_(rate_limit),
+        tokens_capacity_(capacity),
+        tokens_(capacity),
         last_refill_(std::chrono::steady_clock::now()),
-        max_concurrent_hedges_(max_concurrent), active_concurrent_hedges_(0) {}
+        max_concurrent_hedges_(max_concurrent) {}
 
-  void Enqueue(std::function<void()> task) {
+  ~HedgingThreadPool() {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      if (stop_) return;
-      tasks_.push(std::move(task));
-
-      // Lazy Spawning: Only spawn a new thread if we have no idle threads
-      // and we haven't hit our maximum concurrency ceiling yet.
-      if (idle_threads_ == 0 && workers_.size() < max_threads_) {
-        SpawnWorker();
-      }
+      stop_ = true;
     }
-    cv_.notify_one();
+    cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) worker.join();
+    }
   }
 
+  /**
+   * Schedule @p task to run on a pool thread.
+   *
+   * Returns false if the pool is shutting down, in which case the task is
+   * *not* scheduled. Callers waiting on the task's side effects must handle
+   * this case (e.g. by running the task inline), or they would block forever.
+   */
+  bool Enqueue(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (stop_) return false;
+      tasks_.push(std::move(task));
+      // Only spawn a new thread if there are no idle threads and the pool has
+      // not reached its thread ceiling.
+      if (idle_threads_ == 0 && workers_.size() < max_threads_) SpawnWorker();
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+  /**
+   * Try to reserve capacity for one hedged request.
+   *
+   * On success the caller *must* eventually call `ReleaseHedgeSlot()`.
+   */
   bool TryAcquireHedgeToken() {
-    // 1. Gate 1: Check Active Concurrency Limit (Instantaneous active thread ceiling)
-    if (max_concurrent_hedges_ > 0) {
-      if (active_concurrent_hedges_.load(std::memory_order_relaxed) >= max_concurrent_hedges_) {
-        return false;
-      }
+    // Gate 1: the ceiling on concurrently active hedges.
+    if (max_concurrent_hedges_ > 0 &&
+        active_concurrent_hedges_.load(std::memory_order_relaxed) >=
+            max_concurrent_hedges_) {
+      return false;
     }
 
-    // 2. Gate 2: Check QPS Limit (Token Bucket)
+    // Gate 2: the rate limit on new hedges (token bucket).
     if (rate_limit_ > 0.0) {
       std::lock_guard<std::mutex> lock(limiter_mutex_);
       Refill();
-      if (tokens_ < 1.0) {
-        return false;
-      }
+      if (tokens_ < 1.0) return false;
       tokens_ -= 1.0;
     }
 
-    // Successfully acquired: Increment active concurrent counter
     if (max_concurrent_hedges_ > 0) {
       active_concurrent_hedges_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -91,37 +117,19 @@ class HedgingThreadPool {
     }
   }
 
-  ~HedgingThreadPool() {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      stop_ = true;
-    }
-    cv_.notify_all();
-    for (std::thread& worker : workers_) {
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
-  }
-
  private:
   void SpawnWorker() {
     workers_.emplace_back([this] {
       while (true) {
         std::function<void()> task;
         {
-          std::unique_lock<std::mutex> lock(this->queue_mutex_);
-          this->idle_threads_++;
-          this->cv_.wait(lock, [this] {
-            return this->stop_ || !this->tasks_.empty();
-          });
-          this->idle_threads_--;
-
-          if (this->stop_ && this->tasks_.empty()) {
-            return;
-          }
-          task = std::move(this->tasks_.front());
-          this->tasks_.pop();
+          std::unique_lock<std::mutex> lock(queue_mutex_);
+          ++idle_threads_;
+          cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+          --idle_threads_;
+          if (stop_ && tasks_.empty()) return;
+          task = std::move(tasks_.front());
+          tasks_.pop();
         }
         task();
       }
@@ -130,29 +138,32 @@ class HedgingThreadPool {
 
   void Refill() {
     auto now = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_refill_).count();
+    auto const elapsed =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now -
+                                                                  last_refill_)
+            .count();
     last_refill_ = now;
-    tokens_ = (std::min)(tokens_capacity_, tokens_ + duration * rate_limit_);
+    tokens_ = (std::min)(tokens_capacity_, tokens_ + elapsed * rate_limit_);
   }
 
   std::size_t max_threads_;
-  std::size_t idle_threads_;
+  std::size_t idle_threads_ = 0;
   std::vector<std::thread> workers_;
   std::queue<std::function<void()>> tasks_;
   std::mutex queue_mutex_;
   std::condition_variable cv_;
-  bool stop_;
+  bool stop_ = false;
 
-  // Token Bucket Rate Limiter
+  // Token bucket rate limiter.
   double rate_limit_;
   double tokens_capacity_;
   double tokens_;
   std::chrono::steady_clock::time_point last_refill_;
   std::mutex limiter_mutex_;
 
-  // Concurrency Limiter
+  // Concurrency limiter.
   std::int64_t max_concurrent_hedges_;
-  std::atomic<std::int64_t> active_concurrent_hedges_;
+  std::atomic<std::int64_t> active_concurrent_hedges_{0};
 };
 
 }  // namespace internal

@@ -17,8 +17,8 @@
 
 #include "google/cloud/storage/idempotency_policy.h"
 #include "google/cloud/storage/internal/generic_stub.h"
-#include "google/cloud/storage/internal/storage_connection.h"
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
+#include "google/cloud/storage/internal/storage_connection.h"
 #include "google/cloud/storage/object_read_stream.h"
 #include "google/cloud/storage/retry_policy.h"
 #include "google/cloud/storage/version.h"
@@ -175,8 +175,6 @@ class StorageConnectionImpl
   std::vector<std::string> InspectStackStructure() const override;
 
  private:
-  std::shared_ptr<HedgingThreadPool> hedge_pool() const override { return hedge_pool_; }
-  std::shared_ptr<HedgingThreadPool> hedge_pool_;
   explicit StorageConnectionImpl(
       std::unique_ptr<storage_internal::GenericStub> stub, Options options);
 
@@ -190,6 +188,7 @@ class StorageConnectionImpl
 
   std::unique_ptr<storage_internal::GenericStub> stub_;
   Options options_;
+  std::shared_ptr<HedgingThreadPool> hedge_pool_;
   google::cloud::internal::InvocationIdGenerator invocation_id_generator_;
 };
 

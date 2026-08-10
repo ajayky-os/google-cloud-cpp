@@ -13,28 +13,74 @@
 // limitations under the License.
 
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
-#include "google/cloud/internal/make_status.h"
-#include <thread>
-#include <future>
-#include <cstring>
 #include <atomic>
+#include <cstring>
+#include <future>
+#include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
 namespace storage {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
+namespace {
+
+struct RaceResult {
+  StatusOr<ReadSourceResult> result;
+  std::unique_ptr<ObjectReadSource> source;
+  std::vector<char> buffer;
+};
+
+struct RaceState {
+  std::promise<RaceResult> promise;
+  std::atomic<bool> resolved{false};
+};
+
+// Opens a new child and performs its initial read, resolving the race if this
+// attempt finishes first. Losing attempts close their child. Only the primary
+// attempt resolves the race on an open error: a hedge that fails to open must
+// not mask a slower, but successful, primary.
+void RunAttempt(std::shared_ptr<RaceState> const& state,
+                HedgedObjectReadSource::ChildFactory const& factory,
+                std::size_t n, bool resolve_on_open_error,
+                std::shared_ptr<HedgingThreadPool> release_slot) {
+  struct SlotGuard {
+    std::shared_ptr<HedgingThreadPool> pool;
+    ~SlotGuard() {
+      if (pool) pool->ReleaseHedgeSlot();
+    }
+  } guard{std::move(release_slot)};
+
+  auto source = factory();
+  if (!source) {
+    if (!resolve_on_open_error) return;
+    auto expected = false;
+    if (state->resolved.compare_exchange_strong(expected, true)) {
+      state->promise.set_value(
+          RaceResult{std::move(source).status(), nullptr, {}});
+    }
+    return;
+  }
+  std::vector<char> buffer(n);
+  auto result = (*source)->Read(buffer.data(), n);
+  auto expected = false;
+  if (state->resolved.compare_exchange_strong(expected, true)) {
+    state->promise.set_value(
+        RaceResult{std::move(result), *std::move(source), std::move(buffer)});
+  } else {
+    (*source)->Close();
+  }
+}
+
+}  // namespace
 
 HedgedObjectReadSource::HedgedObjectReadSource(
-    std::shared_ptr<HedgingThreadPool> hedge_pool,
-    ReadObjectRangeRequest request,
-    ChildFactory child_factory,
-    std::chrono::milliseconds min_delay,
-    int max_hedges)
+    std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
+    std::chrono::milliseconds delay, int max_hedges)
     : hedge_pool_(std::move(hedge_pool)),
-      request_(std::move(request)),
       child_factory_(std::move(child_factory)),
-      min_delay_(min_delay),
+      delay_(delay),
       max_hedges_(max_hedges) {}
 
 bool HedgedObjectReadSource::IsOpen() const {
@@ -44,102 +90,46 @@ bool HedgedObjectReadSource::IsOpen() const {
 
 StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
   if (active_child_) return active_child_->Close();
-  return HttpResponse{200, "", {}};
+  // The source was never read from, there is no child (or HTTP response) to
+  // close.
+  return HttpResponse{HttpStatusCode::kOk, {}, {}};
 }
 
-enum class SourceType { kPrimary, kHedge };
+StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
+                                                        std::size_t n) {
+  // Only the stream open is hedged. Once a child has won the race all
+  // subsequent reads continue on it, at its current offset, without any
+  // thread hops or extra copies.
+  if (active_child_) return active_child_->Read(buf, n);
 
-struct RaceResult {
-    StatusOr<ReadSourceResult> result;
-    std::unique_ptr<ObjectReadSource> winner_source;
-    std::vector<char> winner_buffer;
-    std::chrono::milliseconds duration;
-    SourceType winner_type;
-};
+  auto state = std::make_shared<RaceState>();
+  auto future = state->promise.get_future();
 
-StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf, std::size_t n) {
-  // Under the simplified model, we use the fixed delay safety floor (default: e.g. 500ms)
-  auto target_delay = min_delay_;
-
-  auto promise = std::make_shared<std::promise<RaceResult>>();
-  auto future = promise->get_future();
-  auto resolved = std::make_shared<std::atomic<bool>>(false);
-  
-  auto start_time = std::chrono::steady_clock::now();
-
-  auto execute_task = [n, start_time, promise, resolved](
-      std::shared_ptr<std::unique_ptr<ObjectReadSource>> shared_source,
-      SourceType type,
-      std::shared_ptr<HedgingThreadPool> pool_for_release = nullptr) {
-      
-      struct ConcurrencyGuard {
-          std::shared_ptr<HedgingThreadPool> p;
-          ~ConcurrencyGuard() { if (p) p->ReleaseHedgeSlot(); }
-      } guard{pool_for_release};
-      
-      if (!*shared_source) return;
-      
-      std::vector<char> local_buf(n);
-      auto res = (*shared_source)->Read(local_buf.data(), n);
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-      
-      bool expected = false;
-      if (resolved->compare_exchange_strong(expected, true)) {
-          promise->set_value(RaceResult{
-              std::move(res), 
-              std::move(*shared_source), 
-              std::move(local_buf), 
-              duration, 
-              type
-          });
-      } else {
-          if (*shared_source) (*shared_source)->Close();
-      }
+  auto primary = [state, factory = child_factory_, n] {
+    RunAttempt(state, factory, n, /*resolve_on_open_error=*/true, nullptr);
   };
+  // If the pool is shutting down run the attempt inline, the read must
+  // complete either way.
+  if (!hedge_pool_->Enqueue(primary)) primary();
 
-  if (active_child_) {
-      auto shared_primary = std::make_shared<std::unique_ptr<ObjectReadSource>>(std::move(active_child_));
-      hedge_pool_->Enqueue([execute_task, shared_primary]() {
-          execute_task(shared_primary, SourceType::kPrimary);
-      });
-  } else {
-      hedge_pool_->Enqueue([execute_task, factory = child_factory_, promise, resolved]() {
-          auto local_primary_status = factory();
-          if (!local_primary_status) {
-              bool expected = false;
-              if (resolved->compare_exchange_strong(expected, true)) {
-                  promise->set_value(RaceResult{local_primary_status.status(), nullptr, {}, std::chrono::milliseconds(0), SourceType::kPrimary});
-              }
-              return;
-          }
-          auto shared_primary = std::make_shared<std::unique_ptr<ObjectReadSource>>(*std::move(local_primary_status));
-          execute_task(shared_primary, SourceType::kPrimary);
-      });
+  for (int i = 0; i != max_hedges_; ++i) {
+    if (future.wait_for(delay_) != std::future_status::timeout) break;
+    if (!hedge_pool_->TryAcquireHedgeToken()) continue;
+    auto hedge = [state, factory = child_factory_, n, pool = hedge_pool_] {
+      RunAttempt(state, factory, n, /*resolve_on_open_error=*/false, pool);
+    };
+    if (!hedge_pool_->Enqueue(hedge)) {
+      hedge_pool_->ReleaseHedgeSlot();
+      break;
+    }
   }
 
-  if (future.wait_for(target_delay) == std::future_status::timeout) {
-      if (hedge_pool_->TryAcquireHedgeToken()) {
-          hedge_pool_->Enqueue([execute_task, factory = child_factory_, pool = hedge_pool_]() {
-              auto hedge_source_status = factory();
-              auto shared_hedge = std::make_shared<std::unique_ptr<ObjectReadSource>>();
-              if (hedge_source_status) {
-                  *shared_hedge = *std::move(hedge_source_status);
-              }
-              execute_task(shared_hedge, SourceType::kHedge, pool);
-          });
-      }
+  auto race = future.get();
+  active_child_ = std::move(race.source);
+  if (race.result.ok() && race.result->bytes_received > 0) {
+    std::memcpy(buf, race.buffer.data(), race.result->bytes_received);
   }
-
-  auto final_result = future.get();
-
-  active_child_ = std::move(final_result.winner_source);
-
-  if (final_result.result.ok() && final_result.result->bytes_received > 0) {
-      std::memcpy(buf, final_result.winner_buffer.data(), final_result.result->bytes_received);
-  }
-
-  return final_result.result;
+  return race.result;
 }
 
 }  // namespace internal

@@ -13,9 +13,10 @@
 // limitations under the License.
 
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 
 namespace google {
@@ -27,41 +28,44 @@ namespace {
 
 TEST(HedgingThreadPoolTest, EnqueueAndExecute) {
   HedgingThreadPool pool(2, 0.0, 0.0, 0);
-  std::atomic<int> counter{0};
-  
-  pool.Enqueue([&]() { counter++; });
-  pool.Enqueue([&]() { counter++; });
-  
-  // Wait a bit for threads to execute
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  
-  EXPECT_EQ(counter.load(), 2);
+  std::promise<void> p1;
+  std::promise<void> p2;
+
+  EXPECT_TRUE(pool.Enqueue([&p1] { p1.set_value(); }));
+  EXPECT_TRUE(pool.Enqueue([&p2] { p2.set_value(); }));
+
+  p1.get_future().get();
+  p2.get_future().get();
 }
 
 TEST(HedgingThreadPoolTest, MaxConcurrentHedgesLimit) {
-  // Max 1 concurrent hedge allowed
+  // Only one concurrent hedge allowed.
   HedgingThreadPool pool(5, 0.0, 0.0, 1);
-  
+
   EXPECT_TRUE(pool.TryAcquireHedgeToken());
-  EXPECT_FALSE(pool.TryAcquireHedgeToken()); // Should fail because 1 is active
-  
+  // Fails because one hedge is active.
+  EXPECT_FALSE(pool.TryAcquireHedgeToken());
+
   pool.ReleaseHedgeSlot();
-  
-  EXPECT_TRUE(pool.TryAcquireHedgeToken()); // Should succeed now
+
+  EXPECT_TRUE(pool.TryAcquireHedgeToken());
 }
 
 TEST(HedgingThreadPoolTest, RateLimiter) {
-  // Rate limit of 5.0 tokens per second (1 token per 200ms), capacity 2
+  // A rate limit of 5.0 tokens per second (one token per 200ms), and a burst
+  // capacity of 2 tokens.
   HedgingThreadPool pool(5, 5.0, 2.0, 0);
-  
+
   EXPECT_TRUE(pool.TryAcquireHedgeToken());
   EXPECT_TRUE(pool.TryAcquireHedgeToken());
-  EXPECT_FALSE(pool.TryAcquireHedgeToken()); // Capacity exhausted
-  
-  std::this_thread::sleep_for(std::chrono::milliseconds(250)); // Wait for > 200ms (1 token)
-  
-  EXPECT_TRUE(pool.TryAcquireHedgeToken());
+  // The burst capacity is exhausted.
   EXPECT_FALSE(pool.TryAcquireHedgeToken());
+
+  // The refill is time-based, there is no way to inject a fake clock. Wait
+  // longer than one token's refill period, with margin for slow machines.
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+  EXPECT_TRUE(pool.TryAcquireHedgeToken());
 }
 
 }  // namespace

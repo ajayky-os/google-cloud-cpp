@@ -34,7 +34,11 @@ namespace storage_experimental {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
 /**
- * Enable experimental request hedging for HTTP/JSON ReadObject streams.
+ * Enable experimental request hedging for `ReadObject()` streams.
+ *
+ * When enabled, opening a download races the initial request against one or
+ * more delayed, duplicate ("hedged") requests, and the first to respond wins.
+ * This reduces tail latency at the cost of additional requests.
  *
  * @ingroup storage-options
  */
@@ -43,8 +47,9 @@ struct EnableReadHedgingOption {
 };
 
 /**
- * The maximum allowed rate of hedges per second across the connection.
- * Default: 0.0 (unlimited/no rate limit).
+ * The maximum rate of hedged requests per second across the connection.
+ *
+ * The default is 0.0, meaning no rate limit.
  *
  * @ingroup storage-options
  */
@@ -53,8 +58,10 @@ struct ReadHedgeRateLimitOption {
 };
 
 /**
- * The maximum allowed concurrent active background hedges running at any instant.
- * Default: 0 (unlimited/no concurrency limit).
+ * The maximum number of concurrently active hedged requests across the
+ * connection.
+ *
+ * The default is 0, meaning no concurrency limit.
  *
  * @ingroup storage-options
  */
@@ -63,8 +70,9 @@ struct MaxConcurrentHedgesOption {
 };
 
 /**
- * The static delay before initiating a parallel hedge (used in kFixed strategy).
- * Default: 500 milliseconds.
+ * The delay before starting a hedged request.
+ *
+ * The default is 500 milliseconds.
  *
  * @ingroup storage-options
  */
@@ -73,17 +81,16 @@ struct ReadHedgeDelayOption {
 };
 
 /**
- * The maximum number of parallel hedged requests allowed per stream.
- * Default: 2.
+ * The maximum number of hedged requests per stream open.
+ *
+ * The default is 2. Set to 0 to disable hedging for reads even when
+ * `EnableReadHedgingOption` is set.
  *
  * @ingroup storage-options
  */
 struct MaxReadHedgesOption {
   using Type = int;
 };
-
-GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
-GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
 /**
  * Set the HTTP version used by the client.
@@ -453,10 +460,16 @@ using ClientOptionList = ::google::cloud::OptionList<
     ConnectionPoolSizeOption, DownloadBufferSizeOption, UploadBufferSizeOption,
     EnableCurlSslLockingOption, EnableCurlSigpipeHandlerOption,
     MaximumCurlSocketRecvSizeOption, MaximumCurlSocketSendSizeOption,
-    storage_experimental::HttpConnectTimeoutOption, TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
+    TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
     IdempotencyPolicyOption, CARootsFilePathOption,
     UploadChecksumValidationOption, DownloadChecksumValidationOption,
     PrecomputedChecksumsOption, storage_experimental::HttpVersionOption,
+    storage_experimental::HttpConnectTimeoutOption,
+    storage_experimental::EnableReadHedgingOption,
+    storage_experimental::ReadHedgeRateLimitOption,
+    storage_experimental::MaxConcurrentHedgesOption,
+    storage_experimental::ReadHedgeDelayOption,
+    storage_experimental::MaxReadHedgesOption,
     storage_experimental::OTelSpanEnrichmentOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
