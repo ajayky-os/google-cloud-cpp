@@ -33,9 +33,13 @@ namespace cloud {
 namespace storage_experimental {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
+/// The strategy used to compute the delay before starting a hedged request.
 enum class HedgingStrategy {
+  /// Always wait for `ReadHedgeDelayOption`.
   kFixed,
-  kDynamic
+  /// Adapt the delay to the observed p99 latency of previous reads, with
+  /// `ReadHedgeDelayOption` as a lower bound.
+  kDynamic,
 };
 
 /**
@@ -77,6 +81,9 @@ struct MaxConcurrentHedgesOption {
 /**
  * The delay before starting a hedged request.
  *
+ * With `HedgingStrategy::kFixed` this is the delay. With
+ * `HedgingStrategy::kDynamic` this is the lower bound for the computed delay.
+ *
  * The default is 500 milliseconds.
  *
  * @ingroup storage-options
@@ -86,8 +93,9 @@ struct ReadHedgeDelayOption {
 };
 
 /**
- * Select between Fixed and Dynamic hedging strategies.
- * Default: HedgingStrategy::kDynamic.
+ * Select the hedging strategy.
+ *
+ * The default is `HedgingStrategy::kDynamic`.
  *
  * @ingroup storage-options
  */
@@ -96,8 +104,10 @@ struct HedgingStrategyOption {
 };
 
 /**
- * The safety multiplier applied to the p99 latency to calculate the dynamic threshold.
- * Default: 1.2.
+ * The safety multiplier applied to the rolling p99 latency to compute the
+ * hedge delay in the `HedgingStrategy::kDynamic` strategy.
+ *
+ * The default is 1.2.
  *
  * @ingroup storage-options
  */
@@ -494,6 +504,8 @@ using ClientOptionList = ::google::cloud::OptionList<
     storage_experimental::ReadHedgeRateLimitOption,
     storage_experimental::MaxConcurrentHedgesOption,
     storage_experimental::ReadHedgeDelayOption,
+    storage_experimental::HedgingStrategyOption,
+    storage_experimental::DynamicHedgeMultiplierOption,
     storage_experimental::MaxReadHedgesOption,
     storage_experimental::OTelSpanEnrichmentOption>;
 

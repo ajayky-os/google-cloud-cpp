@@ -63,7 +63,8 @@ TEST(HedgedObjectReadSourceTest, PrimaryWins) {
     return std::unique_ptr<ObjectReadSource>(std::move(mock));
   };
 
-  HedgedObjectReadSource source(MakeUnlimitedPool(), factory,
+  HedgedObjectReadSource source(MakeUnlimitedPool(), /*hedge_manager=*/nullptr,
+                                factory, /*multiplier=*/1.2,
                                 std::chrono::milliseconds(500),
                                 /*max_hedges=*/2);
 
@@ -90,7 +91,8 @@ TEST(HedgedObjectReadSourceTest, SubsequentReadsContinueOnWinner) {
     return std::unique_ptr<ObjectReadSource>(std::move(mock));
   };
 
-  HedgedObjectReadSource source(MakeUnlimitedPool(), factory,
+  HedgedObjectReadSource source(MakeUnlimitedPool(), /*hedge_manager=*/nullptr,
+                                factory, /*multiplier=*/1.2,
                                 std::chrono::milliseconds(500),
                                 /*max_hedges=*/2);
 
@@ -126,7 +128,8 @@ TEST(HedgedObjectReadSourceTest, HedgeWinsWhenPrimaryStalls) {
   };
 
   auto source = std::make_unique<HedgedObjectReadSource>(
-      MakeUnlimitedPool(), factory, std::chrono::milliseconds(1),
+      MakeUnlimitedPool(), /*hedge_manager=*/nullptr, factory,
+      /*multiplier=*/1.2, std::chrono::milliseconds(1),
       /*max_hedges=*/2);
 
   std::vector<char> buffer(100);
@@ -143,7 +146,8 @@ TEST(HedgedObjectReadSourceTest, PrimaryOpenErrorPropagates) {
     return Status(StatusCode::kPermissionDenied, "uh-oh");
   };
 
-  HedgedObjectReadSource source(MakeUnlimitedPool(), factory,
+  HedgedObjectReadSource source(MakeUnlimitedPool(), /*hedge_manager=*/nullptr,
+                                factory, /*multiplier=*/1.2,
                                 std::chrono::milliseconds(500),
                                 /*max_hedges=*/2);
 
@@ -152,11 +156,31 @@ TEST(HedgedObjectReadSourceTest, PrimaryOpenErrorPropagates) {
               StatusIs(StatusCode::kPermissionDenied));
 }
 
+TEST(HedgedObjectReadSourceTest, RecordsLatencyWithDynamicManager) {
+  auto manager = std::make_shared<DynamicHedgeThresholdManager>();
+  auto factory = []() -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    EXPECT_CALL(*mock, Read).WillOnce(Return(MakeReadResult("payload")));
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedPool(), manager, factory,
+                                /*multiplier=*/1.2,
+                                std::chrono::milliseconds(500),
+                                /*max_hedges=*/2);
+
+  std::vector<char> buffer(100);
+  auto result = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(result, IsOk());
+  EXPECT_THAT(result->bytes_received, Eq(7));
+}
+
 TEST(HedgedObjectReadSourceTest, CloseWithoutReadSucceeds) {
   auto factory = []() -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     return Status(StatusCode::kUnimplemented, "never called");
   };
-  HedgedObjectReadSource source(MakeUnlimitedPool(), factory,
+  HedgedObjectReadSource source(MakeUnlimitedPool(), /*hedge_manager=*/nullptr,
+                                factory, /*multiplier=*/1.2,
                                 std::chrono::milliseconds(500),
                                 /*max_hedges=*/2);
   EXPECT_TRUE(source.IsOpen());

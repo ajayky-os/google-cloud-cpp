@@ -447,6 +447,7 @@ if (BUILD_TESTING)
         internal/const_buffer_test.cc
         internal/crc32c_test.cc
         internal/default_object_acl_requests_test.cc
+        internal/dynamic_hedge_threshold_manager_test.cc
         internal/generate_message_boundary_test.cc
         internal/generic_request_test.cc
         internal/hash_function_impl_test.cc

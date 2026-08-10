@@ -17,12 +17,8 @@
 
 #include "google/cloud/storage/version.h"
 #include <chrono>
-#include <cstdint>
 #include <mutex>
 #include <vector>
-#include <thread>
-#include <atomic>
-#include <memory>
 
 namespace google {
 namespace cloud {
@@ -30,68 +26,50 @@ namespace storage {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
-struct HedgeMetrics {
-  std::uint64_t open_primary_wins = 0;
-  std::uint64_t open_hedge_wins = 0;
-  std::uint64_t read_primary_wins = 0;
-  std::uint64_t read_hedge_wins = 0;
-};
-
 /**
- * Tracks the rolling p95 latency for GCS Object reads categorized by size bucket.
- * Also owns a thread registry ("trash bin") to safely reap orphaned hedged requests.
+ * Tracks a rolling p99 of observed read latencies, bucketed by read size.
+ *
+ * `HedgedObjectReadSource` records the latency of each successful stream open
+ * (including its initial read) and asks for the hedge delay before starting a
+ * new race. The delay adapts to the observed tail latency: a hedge only
+ * starts once the primary is slower than most (p99) previous opens. Until a
+ * bucket has enough samples a static, size-based fallback ladder is used.
+ *
+ * This class is thread-safe. Share one instance per connection so samples
+ * accumulate across streams.
  */
 class DynamicHedgeThresholdManager {
  public:
   DynamicHedgeThresholdManager() = default;
-  ~DynamicHedgeThresholdManager();
 
-  // Records a successful read latency for a given byte size.
+  /// Records the latency of a successful read of @p size bytes.
   void RecordLatency(std::size_t size, std::chrono::milliseconds latency);
-  
-  // Metrics tracking
-  void RecordHedgeResult(bool is_open_phase, bool hedge_won);
-  HedgeMetrics GetHedgeMetrics() const;
-  void DumpLatencies(std::string const& filename) const;
-  void DumpLatencies() const;
 
-  // Calculates the hedge delay based on the rolling p95 of the size bucket.
+  /**
+   * Returns the hedge delay for a read of @p size bytes.
+   *
+   * The delay is @p multiplier times the rolling p99 of the size bucket, or a
+   * static fallback until the bucket has `kMinSamplesForPercentile` samples.
+   * The result is never less than @p min_delay.
+   */
   std::chrono::milliseconds CalculateHedgeDelay(
-      std::size_t size, double multiplier,
-      std::chrono::milliseconds min_delay);
-
-  // Registers a stalled background thread so it can be reaped when it eventually finishes,
-  // preventing user thread blocking and thread leaks.
-  void RegisterOrphan(std::thread t, std::shared_ptr<std::atomic<bool>> is_done);
+      std::size_t size, double multiplier, std::chrono::milliseconds min_delay);
 
  private:
   struct SizeBucket {
     std::mutex mu;
     std::vector<std::chrono::milliseconds> samples;
     std::size_t index = 0;
-    bool is_full = false;
   };
 
   SizeBucket& GetBucket(std::size_t size);
-  std::chrono::milliseconds GetFallbackDelay(std::size_t size);
+  static std::chrono::milliseconds GetFallbackDelay(std::size_t size);
 
   static constexpr std::size_t kNumBuckets = 15;
-  SizeBucket buckets_[kNumBuckets];
   static constexpr std::size_t kMaxSamples = 100;
-  static constexpr std::size_t kMinSamplesForP95 = 10;
+  static constexpr std::size_t kMinSamplesForPercentile = 10;
 
-  // Orphan thread registry
-  struct Orphan {
-      std::thread t;
-      std::shared_ptr<std::atomic<bool>> is_done;
-  };
-  std::mutex orphans_mu_;
-  std::vector<Orphan> orphans_;
-  
-  std::atomic<std::uint64_t> open_primary_wins_{0};
-  std::atomic<std::uint64_t> open_hedge_wins_{0};
-  std::atomic<std::uint64_t> read_primary_wins_{0};
-  std::atomic<std::uint64_t> read_hedge_wins_{0};
+  SizeBucket buckets_[kNumBuckets];
 };
 
 }  // namespace internal

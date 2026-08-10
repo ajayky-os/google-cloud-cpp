@@ -595,7 +595,8 @@ Options DefaultOptions(Options opts) {
         std::chrono::milliseconds(500));
   }
   if (!o.has<storage_experimental::HedgingStrategyOption>()) {
-    o.set<storage_experimental::HedgingStrategyOption>(storage_experimental::HedgingStrategy::kDynamic);
+    o.set<storage_experimental::HedgingStrategyOption>(
+        storage_experimental::HedgingStrategy::kDynamic);
   }
   if (!o.has<storage_experimental::DynamicHedgeMultiplierOption>()) {
     o.set<storage_experimental::DynamicHedgeMultiplierOption>(1.2);

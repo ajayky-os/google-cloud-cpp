@@ -14,7 +14,6 @@
 
 #include "google/cloud/internal/disable_deprecation_warnings.inc"
 #include "google/cloud/storage/internal/connection_impl.h"
-#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
 #include "google/cloud/storage/parallel_upload.h"
@@ -177,6 +176,13 @@ StorageConnectionImpl::StorageConnectionImpl(
     // Allow bursts of up to one second worth of hedges.
     hedge_pool_ = std::make_shared<HedgingThreadPool>(
         max_threads, rate_limit, rate_limit, max_concurrent);
+    // The manager is shared by all streams on this connection so latency
+    // samples accumulate across streams. With the `kFixed` strategy there is
+    // no manager and the hedge delay is always `ReadHedgeDelayOption`.
+    if (options_.get<storage_experimental::HedgingStrategyOption>() ==
+        storage_experimental::HedgingStrategy::kDynamic) {
+      hedge_manager_ = std::make_shared<DynamicHedgeThresholdManager>();
+    }
   }
 }
 
@@ -433,7 +439,6 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   auto const delay = current->get<storage_experimental::ReadHedgeDelayOption>();
   auto const max_hedges =
       current->get<storage_experimental::MaxReadHedgesOption>();
-  auto const strategy = current->get<storage_experimental::HedgingStrategyOption>();
   auto const multiplier =
       current->get<storage_experimental::DynamicHedgeMultiplierOption>();
 
@@ -442,10 +447,9 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   }
 
   return std::unique_ptr<ObjectReadSource>(
-      std::make_unique<HedgedObjectReadSource>(
-          hedge_pool_, std::make_shared<DynamicHedgeThresholdManager>(),
-          request, std::move(retry_source_factory), multiplier, delay,
-          max_hedges));
+      std::make_unique<HedgedObjectReadSource>(hedge_pool_, hedge_manager_,
+                                               std::move(retry_source_factory),
+                                               multiplier, delay, max_hedges));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(

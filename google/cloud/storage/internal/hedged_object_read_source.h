@@ -15,14 +15,13 @@
 #ifndef GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_HEDGED_OBJECT_READ_SOURCE_H
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_HEDGED_OBJECT_READ_SOURCE_H
 
-#include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
+#include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/object_read_source.h"
-#include "google/cloud/storage/internal/object_requests.h"
+#include "google/cloud/storage/version.h"
 #include <chrono>
 #include <functional>
 #include <memory>
-#include <vector>
 
 namespace google {
 namespace cloud {
@@ -30,18 +29,36 @@ namespace storage {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
+/**
+ * Hedge the *open* of an `ObjectReadSource` to reduce tail latency.
+ *
+ * The first `Read()` races one or more children created by `child_factory`:
+ * a primary attempt starts immediately, and up to @p max_hedges additional
+ * attempts start, staggered by the hedge delay, while no attempt has
+ * completed. The first attempt to complete its initial read wins; losing
+ * attempts are closed when they eventually complete.
+ *
+ * With a `DynamicHedgeThresholdManager` (the `kDynamic` strategy) the hedge
+ * delay is `multiplier` times the rolling p99 of previously observed open
+ * latencies, and never less than @p delay. Without a manager (the `kFixed`
+ * strategy) the delay is always @p delay.
+ *
+ * Only the initial open is hedged. `ObjectReadSource` is a stream, so a hedge
+ * started mid-stream would restart from the request's initial offset and
+ * could return the wrong bytes. After the race, all subsequent reads simply
+ * continue on the winning child at its current offset, with no extra threads
+ * or copies.
+ */
 class HedgedObjectReadSource : public ObjectReadSource {
  public:
-  using ChildFactory = std::function<StatusOr<std::unique_ptr<ObjectReadSource>>()>;
+  using ChildFactory =
+      std::function<StatusOr<std::unique_ptr<ObjectReadSource>>()>;
 
   HedgedObjectReadSource(
       std::shared_ptr<HedgingThreadPool> hedge_pool,
       std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager,
-      ReadObjectRangeRequest request,
-      ChildFactory child_factory,
-      double multiplier,
-      std::chrono::milliseconds min_delay,
-      int max_hedges);
+      ChildFactory child_factory, double multiplier,
+      std::chrono::milliseconds delay, int max_hedges);
 
   ~HedgedObjectReadSource() override = default;
 
@@ -52,11 +69,9 @@ class HedgedObjectReadSource : public ObjectReadSource {
  private:
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
   std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager_;
-  ReadObjectRangeRequest request_;
   ChildFactory child_factory_;
-  
   double multiplier_;
-  std::chrono::milliseconds min_delay_;
+  std::chrono::milliseconds delay_;
   int max_hedges_;
 
   std::unique_ptr<ObjectReadSource> active_child_;
