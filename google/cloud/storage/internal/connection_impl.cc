@@ -14,6 +14,7 @@
 
 #include "google/cloud/internal/disable_deprecation_warnings.inc"
 #include "google/cloud/storage/internal/connection_impl.h"
+#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
 #include "google/cloud/storage/parallel_upload.h"
@@ -432,6 +433,9 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   auto const delay = current->get<storage_experimental::ReadHedgeDelayOption>();
   auto const max_hedges =
       current->get<storage_experimental::MaxReadHedgesOption>();
+  auto const strategy = current->get<storage_experimental::HedgingStrategyOption>();
+  auto const multiplier =
+      current->get<storage_experimental::DynamicHedgeMultiplierOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_) {
     return retry_source_factory();
@@ -439,7 +443,9 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
 
   return std::unique_ptr<ObjectReadSource>(
       std::make_unique<HedgedObjectReadSource>(
-          hedge_pool_, std::move(retry_source_factory), delay, max_hedges));
+          hedge_pool_, std::make_shared<DynamicHedgeThresholdManager>(),
+          request, std::move(retry_source_factory), multiplier, delay,
+          max_hedges));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(

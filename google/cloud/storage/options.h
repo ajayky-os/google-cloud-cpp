@@ -33,6 +33,11 @@ namespace cloud {
 namespace storage_experimental {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
+enum class HedgingStrategy {
+  kFixed,
+  kDynamic
+};
+
 /**
  * Enable experimental request hedging for `ReadObject()` streams.
  *
@@ -78,6 +83,26 @@ struct MaxConcurrentHedgesOption {
  */
 struct ReadHedgeDelayOption {
   using Type = std::chrono::milliseconds;
+};
+
+/**
+ * Select between Fixed and Dynamic hedging strategies.
+ * Default: HedgingStrategy::kDynamic.
+ *
+ * @ingroup storage-options
+ */
+struct HedgingStrategyOption {
+  using Type = HedgingStrategy;
+};
+
+/**
+ * The safety multiplier applied to the p99 latency to calculate the dynamic threshold.
+ * Default: 1.2.
+ *
+ * @ingroup storage-options
+ */
+struct DynamicHedgeMultiplierOption {
+  using Type = double;
 };
 
 /**
