@@ -197,6 +197,10 @@ CurlImpl::CurlImpl(CurlHandle handle,
 
   http_version_ = options.get<HttpVersionOption>();
 
+  if (options.has<HttpConnectTimeoutOption>()) {
+    connect_timeout_ms_ = options.get<HttpConnectTimeoutOption>();
+  }
+
   transfer_stall_timeout_ = options.get<TransferStallTimeoutOption>();
   transfer_stall_minimum_rate_ = options.get<TransferStallMinimumRateOption>();
   download_stall_timeout_ = options.get<DownloadStallTimeoutOption>();
@@ -260,6 +264,13 @@ void CurlImpl::WriteHeader(std::string const& header) {
   auto* headers = curl_slist_append(request_headers_.get(), header.c_str());
   (void)request_headers_.release();  // Now owned by list, not us.
   request_headers_.reset(headers);
+}
+
+Status CurlImpl::SetConnectTimeout() {
+  if (connect_timeout_ms_ == std::chrono::milliseconds::zero()) return {};
+  // NOLINTNEXTLINE(google-runtime-int) - libcurl *requires* long
+  auto const timeout_ms = static_cast<long>(connect_timeout_ms_.count());
+  return handle_.SetOption(CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
 }
 
 void CurlImpl::MergeAndWriteHeaders(
@@ -449,6 +460,8 @@ Status CurlImpl::MakeRequest(HttpMethod method, RestContext& context,
       status = handle_.SetOption(CURLOPT_LOW_SPEED_TIME, timeout);
       if (!status.ok()) return OnTransferError(context, std::move(status));
     }
+    status = SetConnectTimeout();
+    if (!status.ok()) return OnTransferError(context, std::move(status));
     return MakeRequestImpl(context);
   }
 
@@ -466,6 +479,9 @@ Status CurlImpl::MakeRequest(HttpMethod method, RestContext& context,
     status = handle_.SetOption(CURLOPT_LOW_SPEED_TIME, timeout);
     if (!status.ok()) return OnTransferError(context, std::move(status));
   }
+
+  status = SetConnectTimeout();
+  if (!status.ok()) return OnTransferError(context, std::move(status));
 
   if (method == HttpMethod::kDelete || request.empty()) {
     return MakeRequestImpl(context);
