@@ -33,6 +33,83 @@ namespace cloud {
 namespace storage_experimental {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
+enum class HedgingStrategy {
+  kFixed,
+  kDynamic
+};
+
+/**
+ * Enable experimental request hedging for HTTP/JSON ReadObject streams.
+ *
+ * @ingroup storage-options
+ */
+struct EnableReadHedgingOption {
+  using Type = bool;
+};
+
+/**
+ * The maximum allowed rate of hedges per second across the connection.
+ * Default: 0.0 (unlimited/no rate limit).
+ *
+ * @ingroup storage-options
+ */
+struct ReadHedgeRateLimitOption {
+  using Type = double;
+};
+
+/**
+ * The maximum allowed concurrent active background hedges running at any instant.
+ * Default: 0 (unlimited/no concurrency limit).
+ *
+ * @ingroup storage-options
+ */
+struct MaxConcurrentHedgesOption {
+  using Type = std::int64_t;
+};
+
+/**
+ * The static delay before initiating a parallel hedge (used in kFixed strategy).
+ * Default: 500 milliseconds.
+ *
+ * @ingroup storage-options
+ */
+struct ReadHedgeDelayOption {
+  using Type = std::chrono::milliseconds;
+};
+
+/**
+ * Select between Fixed and Dynamic hedging strategies.
+ * Default: HedgingStrategy::kDynamic.
+ *
+ * @ingroup storage-options
+ */
+struct HedgingStrategyOption {
+  using Type = HedgingStrategy;
+};
+
+/**
+ * The safety multiplier applied to the p95 latency to calculate the dynamic threshold.
+ * Default: 1.5.
+ *
+ * @ingroup storage-options
+ */
+struct DynamicHedgeMultiplierOption {
+  using Type = double;
+};
+
+/**
+ * The maximum number of parallel hedged requests allowed per stream.
+ * Default: 2.
+ *
+ * @ingroup storage-options
+ */
+struct MaxReadHedgesOption {
+  using Type = int;
+};
+
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
+GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
+
 /**
  * Set the HTTP version used by the client.
  *
@@ -64,6 +141,19 @@ struct HttpVersionOption {
  */
 struct OTelSpanEnrichmentOption {
   using Type = bool;
+};
+
+/**
+ * Sets the TCP/TLS connection timeout.
+ *
+ * If the connection cannot be established within this time, the request is
+ * aborted. This is useful as a fail-safe against OS-level TCP locks during
+ * severe network routing anomalies.
+ *
+ * @ingroup storage-options
+ */
+struct HttpConnectTimeoutOption {
+  using Type = std::chrono::milliseconds;
 };
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
@@ -388,7 +478,7 @@ using ClientOptionList = ::google::cloud::OptionList<
     ConnectionPoolSizeOption, DownloadBufferSizeOption, UploadBufferSizeOption,
     EnableCurlSslLockingOption, EnableCurlSigpipeHandlerOption,
     MaximumCurlSocketRecvSizeOption, MaximumCurlSocketSendSizeOption,
-    TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
+    storage_experimental::HttpConnectTimeoutOption, TransferStallTimeoutOption, RetryPolicyOption, BackoffPolicyOption,
     IdempotencyPolicyOption, CARootsFilePathOption,
     UploadChecksumValidationOption, DownloadChecksumValidationOption,
     PrecomputedChecksumsOption, storage_experimental::HttpVersionOption,

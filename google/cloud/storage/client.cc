@@ -581,6 +581,29 @@ Options DefaultOptions(Options opts) {
                                                                 "/iamapi");
   }
 
+
+  if (!o.has<storage_experimental::EnableReadHedgingOption>()) {
+    o.set<storage_experimental::EnableReadHedgingOption>(false);
+  }
+  if (!o.has<storage_experimental::ReadHedgeRateLimitOption>()) {
+    o.set<storage_experimental::ReadHedgeRateLimitOption>(5.0); // Unlimited by default
+  }
+  if (!o.has<storage_experimental::MaxConcurrentHedgesOption>()) {
+    o.set<storage_experimental::MaxConcurrentHedgesOption>(15); // Unlimited by default
+  }
+  if (!o.has<storage_experimental::HedgingStrategyOption>()) {
+    o.set<storage_experimental::HedgingStrategyOption>(storage_experimental::HedgingStrategy::kDynamic);
+  }
+  if (!o.has<storage_experimental::ReadHedgeDelayOption>()) {
+    o.set<storage_experimental::ReadHedgeDelayOption>(std::chrono::milliseconds(500));
+  }
+  if (!o.has<storage_experimental::DynamicHedgeMultiplierOption>()) {
+    o.set<storage_experimental::DynamicHedgeMultiplierOption>(1.2);
+  }
+  if (!o.has<storage_experimental::MaxReadHedgesOption>()) {
+    o.set<storage_experimental::MaxReadHedgesOption>(2);
+  }
+
   auto logging = GetEnv("CLOUD_STORAGE_ENABLE_TRACING");
   if (logging) {
     for (auto c : absl::StrSplit(*logging, ',')) {
@@ -603,8 +626,11 @@ Options DefaultOptions(Options opts) {
   // use the low-level initialization code in
   // google/cloud/internal/curl_wrappers.cc, these are always needed.
   namespace rest = ::google::cloud::rest_internal;
-  auto rest_defaults = Options{}
-                           .set<rest::DownloadStallTimeoutOption>(
+  auto rest_defaults = Options{};
+  if (o.has<storage_experimental::HttpConnectTimeoutOption>()) {
+    rest_defaults.set<rest::HttpConnectTimeoutOption>(o.get<storage_experimental::HttpConnectTimeoutOption>());
+  }
+  rest_defaults.set<rest::DownloadStallTimeoutOption>(
                                o.get<DownloadStallTimeoutOption>())
                            .set<rest::DownloadStallMinimumRateOption>(
                                o.get<DownloadStallMinimumRateOption>())
