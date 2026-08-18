@@ -16,6 +16,7 @@
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_STORAGE_INTERNAL_CONNECTION_IMPL_H
 
 #include "google/cloud/storage/idempotency_policy.h"
+#include "google/cloud/storage/internal/dynamic_hedge_threshold_manager.h"
 #include "google/cloud/storage/internal/generic_stub.h"
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/storage_connection.h"
@@ -189,6 +190,7 @@ class StorageConnectionImpl
   std::unique_ptr<storage_internal::GenericStub> stub_;
   Options options_;
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
+  std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager_;
   google::cloud::internal::InvocationIdGenerator invocation_id_generator_;
 };
 

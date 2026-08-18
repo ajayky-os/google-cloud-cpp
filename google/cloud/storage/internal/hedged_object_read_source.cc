@@ -13,11 +13,11 @@
 // limitations under the License.
 
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
-#include "google/cloud/internal/make_status.h"
 #include <atomic>
 #include <cstring>
 #include <future>
 #include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -29,7 +29,7 @@ namespace {
 struct RaceResult {
   StatusOr<ReadSourceResult> result;
   std::unique_ptr<ObjectReadSource> source;
-  std::unique_ptr<char[]> buffer;
+  std::vector<char> buffer;
 };
 
 struct RaceState {
@@ -62,20 +62,8 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
     }
     return;
   }
-  std::unique_ptr<char[]> buffer(new (std::nothrow) char[n]);
-  if (!buffer) {
-    if (!resolve_on_open_error) return;
-    auto expected = false;
-    if (state->resolved.compare_exchange_strong(expected, true)) {
-      state->promise.set_value(RaceResult{
-          google::cloud::internal::ResourceExhaustedError(
-              "Out of memory allocating hedge buffer", GCP_ERROR_INFO()),
-          nullptr,
-          {}});
-    }
-    return;
-  }
-  auto result = (*source)->Read(buffer.get(), n);
+  std::vector<char> buffer(n);
+  auto result = (*source)->Read(buffer.data(), n);
   auto expected = false;
   if (state->resolved.compare_exchange_strong(expected, true)) {
     state->promise.set_value(
@@ -88,21 +76,23 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
 }  // namespace
 
 HedgedObjectReadSource::HedgedObjectReadSource(
-    std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
-    std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer)
+    std::shared_ptr<HedgingThreadPool> hedge_pool,
+    std::shared_ptr<DynamicHedgeThresholdManager> hedge_manager,
+    ChildFactory child_factory, double multiplier,
+    std::chrono::milliseconds delay, int max_hedges)
     : hedge_pool_(std::move(hedge_pool)),
+      hedge_manager_(std::move(hedge_manager)),
       child_factory_(std::move(child_factory)),
+      multiplier_(multiplier),
       delay_(delay),
-      max_hedges_(max_hedges),
-      max_buffer_(max_buffer) {}
+      max_hedges_(max_hedges) {}
 
 bool HedgedObjectReadSource::IsOpen() const {
   if (active_child_) return active_child_->IsOpen();
-  return !is_closed_;
+  return true;
 }
 
 StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
-  is_closed_ = true;
   if (active_child_) return active_child_->Close();
   // The source was never read from, there is no child (or HTTP response) to
   // close.
@@ -111,23 +101,15 @@ StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
                                                         std::size_t n) {
-  if (is_closed_) return ReadSourceResult{};
-
   // Only the stream open is hedged. Once a child has won the race all
   // subsequent reads continue on it, at its current offset, without any
   // thread hops or extra copies.
   if (active_child_) return active_child_->Read(buf, n);
 
-  // Racing requires one staging buffer of `n` bytes per attempt, on top of the
-  // caller's own buffer. For a large read that multiplication is worse than
-  // the tail latency it avoids, so open the stream without hedging and read
-  // straight into the caller's buffer.
-  if (n > max_buffer_) {
-    auto child = child_factory_();
-    if (!child) return std::move(child).status();
-    active_child_ = *std::move(child);
-    return active_child_->Read(buf, n);
-  }
+  auto const delay = hedge_manager_ ? hedge_manager_->CalculateHedgeDelay(
+                                          n, multiplier_, delay_)
+                                    : delay_;
+  auto const start = std::chrono::steady_clock::now();
 
   auto state = std::make_shared<RaceState>();
   auto future = state->promise.get_future();
@@ -140,7 +122,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
   if (!hedge_pool_->Enqueue(primary)) primary();
 
   for (int i = 0; i != max_hedges_; ++i) {
-    if (future.wait_for(delay_) != std::future_status::timeout) break;
+    if (future.wait_for(delay) != std::future_status::timeout) break;
     if (!hedge_pool_->TryAcquireHedgeToken()) continue;
     auto hedge = [state, factory = child_factory_, n, pool = hedge_pool_] {
       RunAttempt(state, factory, n, /*resolve_on_open_error=*/false, pool);
@@ -152,9 +134,14 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
   }
 
   auto race = future.get();
+  if (hedge_manager_ && race.result.ok()) {
+    hedge_manager_->RecordLatency(
+        n, std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start));
+  }
   active_child_ = std::move(race.source);
   if (race.result.ok() && race.result->bytes_received > 0) {
-    std::memcpy(buf, race.buffer.get(), race.result->bytes_received);
+    std::memcpy(buf, race.buffer.data(), race.result->bytes_received);
   }
   return race.result;
 }

@@ -33,6 +33,15 @@ namespace cloud {
 namespace storage_experimental {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 
+/// The strategy used to compute the delay before starting a hedged request.
+enum class HedgingStrategy {
+  /// Always wait for `ReadHedgeDelayOption`.
+  kFixed,
+  /// Adapt the delay to the observed p99 latency of previous reads, with
+  /// `ReadHedgeDelayOption` as a lower bound.
+  kDynamic,
+};
+
 /**
  * Enable experimental request hedging for `ReadObject()` streams.
  *
@@ -70,25 +79,10 @@ struct MaxConcurrentHedgesOption {
 };
 
 /**
- * The largest read, in bytes, that is eligible for hedging.
- *
- * Racing requests each buffer their own copy of the data, so the memory used
- * while opening a stream grows with the size of the first read. A read larger
- * than this value is served without hedging, reading directly into the
- * application's buffer, which bounds that growth. Note this is the size the
- * application asks for in a single read (e.g. `stream.read(buf, n)`), not the
- * size of the object or of a requested range.
- *
- * The default is 64 MiB (64 * 1024 * 1024).
- *
- * @ingroup storage-options
- */
-struct MaximumHedgeBufferOption {
-  using Type = std::size_t;
-};
-
-/**
  * The delay before starting a hedged request.
+ *
+ * With `HedgingStrategy::kFixed` this is the delay. With
+ * `HedgingStrategy::kDynamic` this is the lower bound for the computed delay.
  *
  * The default is 500 milliseconds.
  *
@@ -96,6 +90,29 @@ struct MaximumHedgeBufferOption {
  */
 struct ReadHedgeDelayOption {
   using Type = std::chrono::milliseconds;
+};
+
+/**
+ * Select the hedging strategy.
+ *
+ * The default is `HedgingStrategy::kDynamic`.
+ *
+ * @ingroup storage-options
+ */
+struct HedgingStrategyOption {
+  using Type = HedgingStrategy;
+};
+
+/**
+ * The safety multiplier applied to the rolling p99 latency to compute the
+ * hedge delay in the `HedgingStrategy::kDynamic` strategy.
+ *
+ * The default is 1.2.
+ *
+ * @ingroup storage-options
+ */
+struct DynamicHedgeMultiplierOption {
+  using Type = double;
 };
 
 /**
@@ -149,11 +166,6 @@ struct OTelSpanEnrichmentOption {
  * If the connection cannot be established within this time, the request is
  * aborted. This is useful as a fail-safe against OS-level TCP locks during
  * severe network routing anomalies.
- *
- * This applies to all requests, not just downloads, and it only bounds
- * establishing the connection: it has no effect once bytes start flowing. Use
- * `TransferStallTimeoutOption` and `DownloadStallTimeoutOption` to bound
- * stalled transfers.
  *
  * @ingroup storage-options
  */
@@ -491,8 +503,9 @@ using ClientOptionList = ::google::cloud::OptionList<
     storage_experimental::EnableReadHedgingOption,
     storage_experimental::ReadHedgeRateLimitOption,
     storage_experimental::MaxConcurrentHedgesOption,
-    storage_experimental::MaximumHedgeBufferOption,
     storage_experimental::ReadHedgeDelayOption,
+    storage_experimental::HedgingStrategyOption,
+    storage_experimental::DynamicHedgeMultiplierOption,
     storage_experimental::MaxReadHedgesOption,
     storage_experimental::OTelSpanEnrichmentOption>;
 

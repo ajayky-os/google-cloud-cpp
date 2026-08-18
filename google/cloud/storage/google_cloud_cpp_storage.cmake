@@ -96,6 +96,8 @@ add_library(
     internal/curl/request_builder.h
     internal/default_object_acl_requests.cc
     internal/default_object_acl_requests.h
+    internal/dynamic_hedge_threshold_manager.cc
+    internal/dynamic_hedge_threshold_manager.h
     internal/empty_response.cc
     internal/empty_response.h
     internal/generate_message_boundary.cc
@@ -445,6 +447,7 @@ if (BUILD_TESTING)
         internal/const_buffer_test.cc
         internal/crc32c_test.cc
         internal/default_object_acl_requests_test.cc
+        internal/dynamic_hedge_threshold_manager_test.cc
         internal/generate_message_boundary_test.cc
         internal/generic_request_test.cc
         internal/hash_function_impl_test.cc

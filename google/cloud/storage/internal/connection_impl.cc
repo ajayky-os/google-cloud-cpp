@@ -176,6 +176,13 @@ StorageConnectionImpl::StorageConnectionImpl(
     // Allow bursts of up to one second worth of hedges.
     hedge_pool_ = std::make_shared<HedgingThreadPool>(
         max_threads, rate_limit, rate_limit, max_concurrent);
+    // The manager is shared by all streams on this connection so latency
+    // samples accumulate across streams. With the `kFixed` strategy there is
+    // no manager and the hedge delay is always `ReadHedgeDelayOption`.
+    if (options_.get<storage_experimental::HedgingStrategyOption>() ==
+        storage_experimental::HedgingStrategy::kDynamic) {
+      hedge_manager_ = std::make_shared<DynamicHedgeThresholdManager>();
+    }
   }
 }
 
@@ -432,19 +439,17 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   auto const delay = current->get<storage_experimental::ReadHedgeDelayOption>();
   auto const max_hedges =
       current->get<storage_experimental::MaxReadHedgesOption>();
-  auto const max_buffer =
-      current->get<storage_experimental::MaximumHedgeBufferOption>();
+  auto const multiplier =
+      current->get<storage_experimental::DynamicHedgeMultiplierOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_) {
     return retry_source_factory();
   }
 
-  // `max_buffer` bounds the size of an individual read, which is only known
-  // when the application calls `Read()`; the source applies it there.
   return std::unique_ptr<ObjectReadSource>(
-      std::make_unique<HedgedObjectReadSource>(hedge_pool_,
+      std::make_unique<HedgedObjectReadSource>(hedge_pool_, hedge_manager_,
                                                std::move(retry_source_factory),
-                                               delay, max_hedges, max_buffer));
+                                               multiplier, delay, max_hedges));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(
