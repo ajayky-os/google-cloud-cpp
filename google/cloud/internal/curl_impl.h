@@ -123,11 +123,12 @@ class CurlImpl {
 
   void WriteHeader(std::string const& header);
 
-  // Applies `HttpConnectTimeoutOption`, if it is set. Must be called *after*
-  // the stall timeout options: `CURLOPT_CONNECTTIMEOUT_MS` and
-  // `CURLOPT_CONNECTTIMEOUT` configure the same setting in libcurl, and the
-  // last value set wins.
-  Status SetConnectTimeout();
+  // Sets the connection timeout, using `HttpConnectTimeoutOption` when the
+  // application configured one and @p fallback (the relevant stall timeout)
+  // otherwise. This is the only place that sets a connection timeout: libcurl
+  // keeps a single value for `CURLOPT_CONNECTTIMEOUT` and
+  // `CURLOPT_CONNECTTIMEOUT_MS`.
+  Status SetConnectTimeout(std::chrono::seconds fallback);
 
   // Cleanup the CURL handles, leaving them ready for reuse.
   void CleanupHandles();
