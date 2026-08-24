@@ -79,6 +79,8 @@ class HedgedObjectReadSource : public ObjectReadSource {
   void Cancel() override;
 
  private:
+  StatusOr<ReadSourceResult> ReadImpl(char* buf, std::size_t n);
+
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
   ChildFactory child_factory_;
   std::chrono::milliseconds delay_;
@@ -90,6 +92,10 @@ class HedgedObjectReadSource : public ObjectReadSource {
   std::shared_ptr<RaceState> current_race_;
   bool is_closed_ = false;
   bool is_cancelled_ = false;
+  // True while a Read() is in flight. While set, Close() must not destroy
+  // `active_child_` (the reader may be executing inside it); the reader
+  // performs the deferred cleanup when it returns.
+  bool reading_ = false;
 };
 
 }  // namespace internal

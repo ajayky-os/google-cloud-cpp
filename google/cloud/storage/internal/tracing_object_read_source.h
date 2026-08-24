@@ -44,6 +44,7 @@ class TracingObjectReadSource : public storage::internal::ObjectReadSource {
   StatusOr<storage::internal::HttpResponse> Close() override;
   StatusOr<storage::internal::ReadSourceResult> Read(char* buf,
                                                      std::size_t n) override;
+  void Cancel() override;
 
  private:
   opentelemetry::nostd::shared_ptr<opentelemetry::trace::Span> span_;

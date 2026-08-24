@@ -69,6 +69,8 @@ class RetryObjectReadSource : public ObjectReadSource {
   void Cancel() override;
 
  private:
+  StatusOr<ReadSourceResult> ReadWithRetry(char* buf, std::size_t n,
+                                           ObjectReadSource* child);
   bool HandleResult(StatusOr<ReadSourceResult> const& r);
   Status MakeChild(RetryPolicy& retry_policy, BackoffPolicy& backoff_policy);
   StatusOr<std::unique_ptr<ObjectReadSource>> ReadDiscard(
@@ -85,6 +87,11 @@ class RetryObjectReadSource : public ObjectReadSource {
   OffsetDirection offset_direction_;
   std::int64_t current_offset_ = 0;
   bool is_gunzipped_ = false;
+  // Guarded by `mu_`. `reading_` is true while a Read() is in flight; while
+  // set, Close() must not destroy `child_` (the reader may be executing
+  // inside it) and instead defers the cleanup to the reader.
+  bool closed_ = false;
+  bool reading_ = false;
   std::atomic<bool> cancelled_{false};
   std::function<void(std::chrono::milliseconds)> backoff_;
 };

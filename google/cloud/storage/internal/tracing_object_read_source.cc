@@ -48,6 +48,12 @@ StatusOr<storage::internal::HttpResponse> TracingObjectReadSource::Close() {
   return child_->Close();
 }
 
+void TracingObjectReadSource::Cancel() {
+  auto scope = opentelemetry::trace::Scope(span_);
+  span_->AddEvent("gl-cpp.cancel");
+  child_->Cancel();
+}
+
 StatusOr<storage::internal::ReadSourceResult> TracingObjectReadSource::Read(
     char* buf, std::size_t n) {
   auto scope = opentelemetry::trace::Scope(span_);
