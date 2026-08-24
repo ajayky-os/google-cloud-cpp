@@ -36,7 +36,7 @@ GrpcObjectReadSource::GrpcObjectReadSource(
                          : storage::internal::CreateNullHashFunction()) {}
 
 StatusOr<storage::internal::HttpResponse> GrpcObjectReadSource::Close() {
-  if (stream_) stream_ = nullptr;
+  ResetStream();
   if (!status_.ok()) return status_;
   return storage::internal::HttpResponse{
       storage::internal::HttpStatusCode::kOk, {}, {}};
@@ -55,7 +55,7 @@ StatusOr<storage::internal::ReadSourceResult> GrpcObjectReadSource::Read(
   while (result.bytes_received < n && stream_) {
     auto watchdog = timer_source_().then([this](auto f) {
       if (!f.get()) return false;  // timer cancelled, no action needed
-      stream_->Cancel();
+      Cancel();
       return true;
     });
     google::storage::v2::ReadObjectResponse response;
@@ -75,14 +75,14 @@ StatusOr<storage::internal::ReadSourceResult> GrpcObjectReadSource::Read(
                                      metadata.headers.end());
       result.response.headers.insert(metadata.trailers.begin(),
                                      metadata.trailers.end());
-      stream_.reset();
+      ResetStream();
       if (!status_.ok()) return status_;
       return result;
     }
     auto handle_status = HandleResponse(result, buf, n, std::move(response));
     if (!handle_status.ok()) {
       status_ = handle_status;
-      stream_.reset();
+      ResetStream();
       return status_;
     }
   }
@@ -136,6 +136,21 @@ Status GrpcObjectReadSource::HandleResponse(
     result.size = result.size.value_or(metadata.size());
   }
   return {};
+}
+
+void GrpcObjectReadSource::Cancel() {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (stream_) stream_->Cancel();
+}
+
+void GrpcObjectReadSource::ResetStream() {
+  std::unique_ptr<StreamingRpc> stream;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    stream = std::move(stream_);
+  }
+  // `stream` is destroyed here, outside the lock: once moved out a concurrent
+  // Cancel() can no longer reach it, and its destructor may block.
 }
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

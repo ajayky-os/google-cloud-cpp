@@ -599,6 +599,29 @@ TEST(RetryObjectReadSourceTest, TracingDisabled) {
   EXPECT_THAT(spans, IsEmpty());
 }
 
+TEST(RetryObjectReadSourceTest, CancelAbortsReadsAndCancelsChild) {
+  auto source = std::make_unique<MockObjectReadSource>();
+  EXPECT_CALL(*source, Cancel).Times(1);
+
+  ::testing::MockFunction<StatusOr<std::unique_ptr<ObjectReadSource>>(
+      ReadObjectRangeRequest const&, RetryPolicy&, BackoffPolicy&)>
+      factory;
+
+  auto options = BasicTestPolicies();
+  auto retry_policy = options.get<RetryPolicyOption>()->clone();
+  auto backoff_policy = options.get<BackoffPolicyOption>()->clone();
+
+  RetryObjectReadSource tested(
+      factory.AsStdFunction(),
+      google::cloud::internal::MakeImmutableOptions(std::move(options)),
+      ReadObjectRangeRequest{}, std::move(source), std::move(retry_policy),
+      std::move(backoff_policy));
+
+  tested.Cancel();
+  auto response = tested.Read(nullptr, 1024);
+  EXPECT_THAT(response, StatusIs(StatusCode::kCancelled));
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
