@@ -393,6 +393,57 @@ TEST(HedgedObjectReadSourceTest, CancelBeforeReadFailsImmediately) {
   EXPECT_THAT(result, StatusIs(StatusCode::kCancelled));
 }
 
+TEST(HedgedObjectReadSourceTest, HedgeReadFailureDoesNotAbortPrimary) {
+  auto primary_started = std::make_shared<std::promise<void>>();
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+
+  std::atomic<int> attempt_count{0};
+  HedgedObjectReadSource::ChildFactory factory =
+      [=, &attempt_count](std::shared_ptr<std::atomic<bool>> const&)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    int const attempt = attempt_count++;
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (attempt == 0) {
+      // Primary attempt: blocks until unblocked, then succeeds
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([primary_started, unblock_primary](char* buf, std::size_t n) {
+            primary_started->set_value();
+            unblock_primary->get_future().get();
+            std::string const data = "primary_data";
+            std::memcpy(buf, data.data(), (std::min)(n, data.size()));
+            return MakeReadResult(data);
+          });
+    } else {
+      // Hedge attempt: fails immediately on Read()
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(Return(Status(StatusCode::kUnavailable, "hedge read failed")));
+    }
+    EXPECT_CALL(*mock, Close)
+        .WillRepeatedly(Return(HttpResponse{HttpStatusCode::kOk, {}, {}}));
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  auto source = std::make_unique<HedgedObjectReadSource>(
+      MakeUnlimitedPool(), factory, std::chrono::milliseconds(10),
+      /*max_hedges=*/1, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  auto read_async = std::async(std::launch::async, [&]() {
+    return source->Read(buffer.data(), buffer.size());
+  });
+
+  primary_started->get_future().get();
+  // Wait for hedge to trigger and fail its read
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  // Unblock primary
+  unblock_primary->set_value();
+
+  StatusOr<ReadSourceResult> result = read_async.get();
+  ASSERT_THAT(result, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), result->bytes_received),
+              Eq("primary_data"));
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

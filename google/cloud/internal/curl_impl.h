@@ -152,7 +152,8 @@ class CurlImpl {
   CurlHeaders request_headers_;
   CurlHandle handle_;
   CurlMulti multi_;
-  std::shared_ptr<std::atomic<bool>> cancellation_token_;
+  std::shared_ptr<std::atomic<bool>> cancellation_token_ =
+      std::make_shared<std::atomic<bool>>(false);
 
   bool logging_enabled_;
   bool follow_location_;
