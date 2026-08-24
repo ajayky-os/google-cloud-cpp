@@ -111,22 +111,19 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
     reading_ = true;
   }
 
-  auto result = ReadWithRetry(buf, n, child);
+  struct ReadingGuard {
+    RetryObjectReadSource& self;
+    ~ReadingGuard() {
+      std::unique_ptr<ObjectReadSource> discard;
+      {
+        std::lock_guard<std::mutex> lk(self.mu_);
+        self.reading_ = false;
+        if (self.closed_) discard = std::move(self.child_);
+      }
+      if (discard) (void)discard->Close();
+    }
+  } guard{*this};
 
-  // While `reading_` was set, Close() deferred the destruction of `child_` to
-  // this thread. Perform any deferred close now.
-  std::unique_ptr<ObjectReadSource> discard;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    reading_ = false;
-    if (closed_) discard = std::move(child_);
-  }
-  if (discard) (void)discard->Close();
-  return result;
-}
-
-StatusOr<ReadSourceResult> RetryObjectReadSource::ReadWithRetry(
-    char* buf, std::size_t n, ObjectReadSource* child) {
   // Read some data, if successful return immediately, saving some allocations.
   auto result = child->Read(buf, n);
   if (HandleResult(result)) return result;

@@ -69,8 +69,6 @@ class RetryObjectReadSource : public ObjectReadSource {
   void Cancel() override;
 
  private:
-  StatusOr<ReadSourceResult> ReadWithRetry(char* buf, std::size_t n,
-                                           ObjectReadSource* child);
   bool HandleResult(StatusOr<ReadSourceResult> const& r);
   Status MakeChild(RetryPolicy& retry_policy, BackoffPolicy& backoff_policy);
   StatusOr<std::unique_ptr<ObjectReadSource>> ReadDiscard(

@@ -79,8 +79,6 @@ class HedgedObjectReadSource : public ObjectReadSource {
   void Cancel() override;
 
  private:
-  StatusOr<ReadSourceResult> ReadImpl(char* buf, std::size_t n);
-
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
   ChildFactory child_factory_;
   std::chrono::milliseconds delay_;

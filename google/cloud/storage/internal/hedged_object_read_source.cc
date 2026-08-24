@@ -69,16 +69,29 @@ struct RaceState {
     CancelAllExcept(nullptr);
   }
 
-  // Resolve the race with @p status (unless an attempt already resolved it)
-  // and cancel every attempt. Attempts do not fulfill the promise when they
-  // observe a cancelled token, so an external Cancel() or Close() must
-  // resolve the race itself or the reader blocks in `future.get()` forever.
-  void Abort(Status status) {
+  bool TryResolve(StatusOr<ReadSourceResult> result,
+                  std::unique_ptr<ObjectReadSource>& source,
+                  std::unique_ptr<char[]>& buffer,
+                  AttemptHandle const* winner_handle = nullptr) {
     bool expected = false;
-    if (resolved.compare_exchange_strong(expected, true)) {
-      promise.set_value(RaceResult{std::move(status), nullptr, {}});
-    }
-    CancelAll();
+    if (!resolved.compare_exchange_strong(expected, true)) return false;
+    promise.set_value(
+        RaceResult{std::move(result), std::move(source), std::move(buffer)});
+    CancelAllExcept(winner_handle);
+    return true;
+  }
+
+  bool TryResolveStatus(Status status,
+                        AttemptHandle const* winner_handle = nullptr) {
+    bool expected = false;
+    if (!resolved.compare_exchange_strong(expected, true)) return false;
+    promise.set_value(RaceResult{std::move(status), nullptr, {}});
+    CancelAllExcept(winner_handle);
+    return true;
+  }
+
+  void Abort(Status status) {
+    TryResolveStatus(std::move(status));
   }
 };
 
@@ -117,26 +130,18 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   }
 
   if (!source) {
-    if (!resolve_on_error) return;
-    bool expected = false;
-    if (state->resolved.compare_exchange_strong(expected, true)) {
-      state->CancelAllExcept(attempt_handle.get());
-      state->promise.set_value(
-          RaceResult{std::move(source).status(), nullptr, {}});
+    if (resolve_on_error) {
+      state->TryResolveStatus(std::move(source).status(), attempt_handle.get());
     }
     return;
   }
   std::unique_ptr<char[]> buffer(new (std::nothrow) char[n]);
   if (!buffer) {
-    if (!resolve_on_error) return;
-    bool expected = false;
-    if (state->resolved.compare_exchange_strong(expected, true)) {
-      state->CancelAllExcept(attempt_handle.get());
-      state->promise.set_value(RaceResult{
+    if (resolve_on_error) {
+      state->TryResolveStatus(
           google::cloud::internal::ResourceExhaustedError(
               "Out of memory allocating hedge buffer", GCP_ERROR_INFO()),
-          nullptr,
-          {}});
+          attempt_handle.get());
     }
     return;
   }
@@ -173,12 +178,8 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
     return;
   }
 
-  bool expected = false;
-  if (state->resolved.compare_exchange_strong(expected, true)) {
-    state->CancelAllExcept(attempt_handle.get());
-    state->promise.set_value(
-        RaceResult{std::move(result), *std::move(source), std::move(buffer)});
-  } else {
+  if (!state->TryResolve(std::move(result), *source, buffer,
+                         attempt_handle.get())) {
     (void)(*source)->Close();
   }
 }
@@ -265,29 +266,22 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
     }
     reading_ = true;
   }
-  auto result = ReadImpl(buf, n);
-  // While `reading_` was set, Close() deferred the destruction of
-  // `active_child_` to this thread: it cannot delete an object this thread
-  // may still be executing in. Perform any deferred cleanup now.
-  std::unique_ptr<ObjectReadSource> discard;
-  bool cancelled = false;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    reading_ = false;
-    if (is_closed_ || is_cancelled_) {
-      discard = std::move(active_child_);
-      cancelled = is_cancelled_;
-    }
-  }
-  if (discard) {
-    if (cancelled) discard->Cancel();
-    (void)discard->Close();
-  }
-  return result;
-}
 
-StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadImpl(char* buf,
-                                                            std::size_t n) {
+  struct ReadingGuard {
+    HedgedObjectReadSource& self;
+    ~ReadingGuard() {
+      std::unique_ptr<ObjectReadSource> discard;
+      {
+        std::lock_guard<std::mutex> lk(self.mu_);
+        self.reading_ = false;
+        if (self.is_closed_ || self.is_cancelled_) {
+          discard = std::move(self.active_child_);
+        }
+      }
+      if (discard) (void)discard->Close();
+    }
+  } guard{*this};
+
   ObjectReadSource* child = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -298,7 +292,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadImpl(char* buf,
   }
   // `child` remains valid outside the lock: Close() does not destroy the
   // child while `reading_` is set, and this thread only destroys it after
-  // ReadImpl() returns.
+  // Read() returns.
   if (child != nullptr) return child->Read(buf, n);
 
   // Racing requires one staging buffer of `n` bytes per attempt, on top of the
