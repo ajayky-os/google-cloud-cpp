@@ -466,8 +466,7 @@ Status CurlImpl::MakeRequest(HttpMethod method, RestContext& context,
   if (!status.ok()) return OnTransferError(context, std::move(status));
 
   if (method == HttpMethod::kGet) {
-    status =
-        handle_.SetOption(CURLOPT_NOPROGRESS, cancellation_token_ ? 0L : 1L);
+    status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
     if (!status.ok()) return OnTransferError(context, std::move(status));
     if (download_stall_timeout_ != std::chrono::seconds::zero()) {
       // NOLINTNEXTLINE(google-runtime-int) - libcurl *requires* long
@@ -568,15 +567,16 @@ StatusOr<std::size_t> CurlImpl::Read(absl::Span<char> output) {
 
 void CurlImpl::SetCancellationToken(
     std::shared_ptr<std::atomic<bool>> token) {
-  cancellation_token_ = std::move(token);
+  if (token) {
+    if (cancellation_token_->load(std::memory_order_relaxed)) {
+      token->store(true, std::memory_order_relaxed);
+    }
+    cancellation_token_ = std::move(token);
+  }
 }
 
 void CurlImpl::Cancel() {
-  if (!cancellation_token_) {
-    cancellation_token_ = std::make_shared<std::atomic<bool>>(true);
-  } else {
-    cancellation_token_->store(true, std::memory_order_relaxed);
-  }
+  cancellation_token_->store(true, std::memory_order_relaxed);
 #if CURL_AT_LEAST_VERSION(7, 68, 0)
   if (multi_) {
     (void)curl_multi_wakeup(multi_.get());
@@ -585,8 +585,7 @@ void CurlImpl::Cancel() {
 }
 
 int CurlImpl::TransferInfoCallback() {
-  if (cancellation_token_ &&
-      cancellation_token_->load(std::memory_order_relaxed)) {
+  if (cancellation_token_->load(std::memory_order_relaxed)) {
     return 1;
   }
   return 0;
@@ -660,12 +659,12 @@ std::size_t CurlImpl::HeaderCallback(absl::Span<char> response) {
 Status CurlImpl::MakeRequestImpl(RestContext& context) {
   TRACE_STATE() << ", url_=" << url_;
 
-  if (context.cancellation_token() && !cancellation_token_) {
-    cancellation_token_ = context.cancellation_token();
+  if (context.cancellation_token() &&
+      context.cancellation_token() != cancellation_token_) {
+    SetCancellationToken(context.cancellation_token());
   }
 
-  if (cancellation_token_ &&
-      cancellation_token_->load(std::memory_order_relaxed)) {
+  if (cancellation_token_->load(std::memory_order_relaxed)) {
     return OnTransferError(
         context,
         internal::CancelledError("Request cancelled", GCP_ERROR_INFO()));
@@ -692,14 +691,12 @@ Status CurlImpl::MakeRequestImpl(RestContext& context) {
   handle_.SetOptionUnchecked(CURLOPT_HTTP_VERSION,
                              VersionToCurlCode(http_version_));
 
-  if (cancellation_token_) {
-    status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-    status = handle_.SetOption(CURLOPT_XFERINFOFUNCTION, &TransferInfoFunction);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-    status = handle_.SetOption(CURLOPT_XFERINFODATA, this);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-  }
+  status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
+  status = handle_.SetOption(CURLOPT_XFERINFOFUNCTION, &TransferInfoFunction);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
+  status = handle_.SetOption(CURLOPT_XFERINFODATA, this);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
 
   auto error = curl_multi_add_handle(multi_.get(), handle_.handle_.get());
 
@@ -725,12 +722,12 @@ StatusOr<std::size_t> CurlImpl::ReadImpl(RestContext& context,
   avail_ = output;
   TRACE_STATE() << ", begin";
 
-  if (context.cancellation_token() && !cancellation_token_) {
-    cancellation_token_ = context.cancellation_token();
+  if (context.cancellation_token() &&
+      context.cancellation_token() != cancellation_token_) {
+    SetCancellationToken(context.cancellation_token());
   }
 
-  if (cancellation_token_ &&
-      cancellation_token_->load(std::memory_order_relaxed)) {
+  if (cancellation_token_->load(std::memory_order_relaxed)) {
     return OnTransferError(
         context,
         internal::CancelledError("Request cancelled", GCP_ERROR_INFO()));
@@ -754,14 +751,12 @@ StatusOr<std::size_t> CurlImpl::ReadImpl(RestContext& context,
   if (!status.ok()) return OnTransferError(context, std::move(status));
   status = handle_.SetOption(CURLOPT_WRITEDATA, this);
   if (!status.ok()) return OnTransferError(context, std::move(status));
-  if (cancellation_token_) {
-    status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-    status = handle_.SetOption(CURLOPT_XFERINFOFUNCTION, &TransferInfoFunction);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-    status = handle_.SetOption(CURLOPT_XFERINFODATA, this);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
-  }
+  status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
+  status = handle_.SetOption(CURLOPT_XFERINFOFUNCTION, &TransferInfoFunction);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
+  status = handle_.SetOption(CURLOPT_XFERINFODATA, this);
+  if (!status.ok()) return OnTransferError(context, std::move(status));
   handle_.FlushDebug(__func__);
 
   if (!curl_closed_ && paused_) {
@@ -897,8 +892,7 @@ Status CurlImpl::PerformWorkUntil(absl::FunctionRef<bool()> predicate) {
   TRACE_STATE() << ", begin";
   int repeats = 0;
   while (!predicate()) {
-    if (cancellation_token_ &&
-        cancellation_token_->load(std::memory_order_relaxed)) {
+    if (cancellation_token_->load(std::memory_order_relaxed)) {
       return internal::CancelledError("Request cancelled", GCP_ERROR_INFO());
     }
     handle_.FlushDebug(__func__);
@@ -918,7 +912,11 @@ Status CurlImpl::PerformWorkUntil(absl::FunctionRef<bool()> predicate) {
 }
 
 Status CurlImpl::WaitForHandles(int& repeats) {
-  int const timeout_ms = cancellation_token_ ? 50 : 1000;
+#if !CURL_AT_LEAST_VERSION(7, 68, 0)
+  int const timeout_ms = 50;
+#else
+  int const timeout_ms = 1000;
+#endif
   int numfds = 0;
   CURLMcode result;
 #if CURL_AT_LEAST_VERSION(7, 66, 0)

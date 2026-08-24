@@ -74,12 +74,12 @@ namespace {
 
 // Opens a new child and performs its initial read, resolving the race if this
 // attempt finishes first. Losing attempts are cancelled and closed. Only the
-// primary attempt resolves the race on an open error: a hedge that fails to open
-// must not mask a slower, but successful, primary.
+// primary attempt resolves the race on an open or read error: a hedge that fails
+// to open or read must not mask a slower, but successful, primary.
 void RunAttempt(std::shared_ptr<RaceState> const& state,
                 std::shared_ptr<AttemptHandle> const& attempt_handle,
                 HedgedObjectReadSource::ChildFactory const& factory,
-                std::size_t n, bool resolve_on_open_error,
+                std::size_t n, bool resolve_on_error,
                 std::shared_ptr<HedgingThreadPool> release_slot) {
   struct SlotGuard {
     std::shared_ptr<HedgingThreadPool> pool;
@@ -105,7 +105,7 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   }
 
   if (!source) {
-    if (!resolve_on_open_error) return;
+    if (!resolve_on_error) return;
     bool expected = false;
     if (state->resolved.compare_exchange_strong(expected, true)) {
       state->CancelAllExcept(attempt_handle.get());
@@ -116,7 +116,7 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   }
   std::unique_ptr<char[]> buffer(new (std::nothrow) char[n]);
   if (!buffer) {
-    if (!resolve_on_open_error) return;
+    if (!resolve_on_error) return;
     bool expected = false;
     if (state->resolved.compare_exchange_strong(expected, true)) {
       state->CancelAllExcept(attempt_handle.get());
@@ -139,6 +139,11 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   {
     std::lock_guard<std::mutex> lk(attempt_handle->mu);
     attempt_handle->source = nullptr;
+  }
+
+  if (!result && !resolve_on_error) {
+    (void)(*source)->Close();
+    return;
   }
 
   bool expected = false;
@@ -268,7 +273,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
 
   auto primary = [state, primary_handle, factory = child_factory_, n] {
     RunAttempt(state, primary_handle, factory, n,
-               /*resolve_on_open_error=*/true, nullptr);
+               /*resolve_on_error=*/true, nullptr);
   };
   // If the pool is shutting down run the attempt inline, the read must
   // complete either way.
@@ -285,7 +290,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
     auto hedge = [state, hedge_handle, factory = child_factory_, n,
                   pool = hedge_pool_] {
       RunAttempt(state, hedge_handle, factory, n,
-                 /*resolve_on_open_error=*/false, pool);
+                 /*resolve_on_error=*/false, pool);
     };
     if (!hedge_pool_->Enqueue(hedge)) {
       hedge_pool_->ReleaseHedgeSlot();
