@@ -79,6 +79,14 @@ StatusOr<HttpResponse> RetryObjectReadSource::Close() {
   std::unique_ptr<ObjectReadSource> child;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    closed_ = true;
+    if (reading_) {
+      // A Read() is in flight on `child_`: destroying the child here would
+      // leave the reader executing inside a deleted object. Unblock the
+      // reader instead; it discards the child when it returns.
+      if (child_) child_->Cancel();
+      return HttpResponse{HttpStatusCode::kOk, {}, {}};
+    }
     child = std::move(child_);
   }
   if (!child) return HttpResponse{HttpStatusCode::kOk, {}, {}};
@@ -95,13 +103,30 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
   ObjectReadSource* child = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!child_) {
+    if (!child_ || closed_) {
       return google::cloud::internal::FailedPreconditionError(
           "Stream is not open", GCP_ERROR_INFO());
     }
     child = child_.get();
+    reading_ = true;
   }
 
+  auto result = ReadWithRetry(buf, n, child);
+
+  // While `reading_` was set, Close() deferred the destruction of `child_` to
+  // this thread. Perform any deferred close now.
+  std::unique_ptr<ObjectReadSource> discard;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    reading_ = false;
+    if (closed_) discard = std::move(child_);
+  }
+  if (discard) (void)discard->Close();
+  return result;
+}
+
+StatusOr<ReadSourceResult> RetryObjectReadSource::ReadWithRetry(
+    char* buf, std::size_t n, ObjectReadSource* child) {
   // Read some data, if successful return immediately, saving some allocations.
   auto result = child->Read(buf, n);
   if (HandleResult(result)) return result;
@@ -128,6 +153,12 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
     // already be exhausted, so we should fail this operation too.
     {
       std::lock_guard<std::mutex> lk(mu_);
+      if (closed_) {
+        // Close() ran while this read was in flight; do not open new
+        // downloads for a stream the application already closed.
+        return google::cloud::internal::FailedPreconditionError(
+            "Stream closed while a read was in progress", GCP_ERROR_INFO());
+      }
       child_.reset();
     }
 
@@ -158,7 +189,12 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
-      child = child_.get();
+      child = closed_ ? nullptr : child_.get();
+    }
+    if (child == nullptr) {
+      // Close() raced with MakeChild(); the new child is discarded by Read().
+      return google::cloud::internal::FailedPreconditionError(
+          "Stream closed while a read was in progress", GCP_ERROR_INFO());
     }
     result = child->Read(buf, n);
   }

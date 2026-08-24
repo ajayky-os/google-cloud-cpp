@@ -24,6 +24,7 @@
 #include "absl/functional/function_ref.h"
 #include "google/storage/v2/storage.pb.h"
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -58,7 +59,10 @@ class GrpcObjectReadSource : public storage::internal::ObjectReadSource {
 
   ~GrpcObjectReadSource() override = default;
 
-  bool IsOpen() const override { return static_cast<bool>(stream_); }
+  bool IsOpen() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return static_cast<bool>(stream_);
+  }
 
   /// Actively close a download, even if not all the data has been read.
   StatusOr<storage::internal::HttpResponse> Close() override;
@@ -75,7 +79,16 @@ class GrpcObjectReadSource : public storage::internal::ObjectReadSource {
                         std::size_t n,
                         google::storage::v2::ReadObjectResponse response);
 
+  // Release `stream_` and destroy it outside the lock. Cancel() may run on a
+  // different thread than Read()/Close(): the lock guarantees the stream is
+  // not destroyed while Cancel() is calling into it.
+  void ResetStream();
+
   TimerSource timer_source_;
+  // Guards changes to the `stream_` pointer. Only Read()/Close() (which run
+  // on the reader thread) replace the pointer; Cancel() and IsOpen() may run
+  // concurrently on other threads.
+  mutable std::mutex mu_;
   std::unique_ptr<StreamingRpc> stream_;
   std::shared_ptr<storage::internal::HashFunction> hash_function_;
   std::optional<std::int64_t> offset_;

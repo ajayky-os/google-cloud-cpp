@@ -250,7 +250,12 @@ CurlImpl::~CurlImpl() {
   CleanupHandles();
 
   CurlHandle::ReturnToPool(*factory_, std::move(handle_));
-  factory_->CleanupMultiHandle(std::move(multi_), HandleDisposition::kKeep);
+  factory_->CleanupMultiHandle(ReleaseMulti(), HandleDisposition::kKeep);
+}
+
+CurlMulti CurlImpl::ReleaseMulti() {
+  std::lock_guard<std::mutex> lk(multi_mu_);
+  return std::move(multi_);
 }
 
 void CurlImpl::SetHeader(HttpHeader header) {
@@ -466,8 +471,6 @@ Status CurlImpl::MakeRequest(HttpMethod method, RestContext& context,
   if (!status.ok()) return OnTransferError(context, std::move(status));
 
   if (method == HttpMethod::kGet) {
-    status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
-    if (!status.ok()) return OnTransferError(context, std::move(status));
     if (download_stall_timeout_ != std::chrono::seconds::zero()) {
       // NOLINTNEXTLINE(google-runtime-int) - libcurl *requires* long
       auto const timeout = static_cast<long>(download_stall_timeout_.count());
@@ -572,12 +575,17 @@ void CurlImpl::SetCancellationToken(
       token->store(true, std::memory_order_relaxed);
     }
     cancellation_token_ = std::move(token);
+    cancellable_ = true;
   }
 }
 
 void CurlImpl::Cancel() {
   cancellation_token_->store(true, std::memory_order_relaxed);
 #if CURL_AT_LEAST_VERSION(7, 68, 0)
+  // The lock keeps `multi_` alive and owned by this request while the wakeup
+  // is delivered: without it the transfer thread could concurrently return
+  // the handle to the pool, where another request may already be using it.
+  std::lock_guard<std::mutex> lk(multi_mu_);
   if (multi_) {
     (void)curl_multi_wakeup(multi_.get());
   }
@@ -751,12 +759,6 @@ StatusOr<std::size_t> CurlImpl::ReadImpl(RestContext& context,
   if (!status.ok()) return OnTransferError(context, std::move(status));
   status = handle_.SetOption(CURLOPT_WRITEDATA, this);
   if (!status.ok()) return OnTransferError(context, std::move(status));
-  status = handle_.SetOption(CURLOPT_NOPROGRESS, 0L);
-  if (!status.ok()) return OnTransferError(context, std::move(status));
-  status = handle_.SetOption(CURLOPT_XFERINFOFUNCTION, &TransferInfoFunction);
-  if (!status.ok()) return OnTransferError(context, std::move(status));
-  status = handle_.SetOption(CURLOPT_XFERINFODATA, this);
-  if (!status.ok()) return OnTransferError(context, std::move(status));
   handle_.FlushDebug(__func__);
 
   if (!curl_closed_ && paused_) {
@@ -877,6 +879,15 @@ StatusOr<int> CurlImpl::PerformWork() {
       // (see above) tells libcurl that it cannot receive more data.
       if (closing_) continue;
       if (multi_info_read_result != CURLE_OK) {
+        // CURLE_ABORTED_BY_CALLBACK maps to `kAborted`, but when the abort
+        // came from TransferInfoCallback() observing the cancellation token
+        // the caller asked for the cancellation: report `kCancelled` so it is
+        // not mistaken for a permanent failure.
+        if (multi_info_read_result == CURLE_ABORTED_BY_CALLBACK &&
+            cancellation_token_->load(std::memory_order_relaxed)) {
+          return internal::CancelledError("Request cancelled",
+                                          GCP_ERROR_INFO());
+        }
         return CurlHandle::AsStatus(multi_info_read_result, __func__);
       }
       if (multi_remove_result != CURLM_OK) {
@@ -913,7 +924,10 @@ Status CurlImpl::PerformWorkUntil(absl::FunctionRef<bool()> predicate) {
 
 Status CurlImpl::WaitForHandles(int& repeats) {
 #if !CURL_AT_LEAST_VERSION(7, 68, 0)
-  int const timeout_ms = 50;
+  // Without curl_multi_wakeup() a Cancel() from another thread cannot
+  // interrupt the wait, so poll frequently -- but only when some caller can
+  // actually cancel this transfer; other transfers keep the long timeout.
+  int const timeout_ms = cancellable_ ? 50 : 1000;
 #else
   int const timeout_ms = 1000;
 #endif
@@ -967,7 +981,7 @@ Status CurlImpl::OnTransferError(RestContext& context, Status status) {
   // While the handle is suspect, there is probably nothing wrong with the
   // CURLM* handle. That just represents a local resource, such as data
   // structures for epoll(7) or select(2).
-  factory_->CleanupMultiHandle(std::move(multi_), HandleDisposition::kKeep);
+  factory_->CleanupMultiHandle(ReleaseMulti(), HandleDisposition::kKeep);
 
   return status;
 }
@@ -980,7 +994,7 @@ void CurlImpl::OnTransferDone() {
   // in PerformWork(). Release the handles back to the factory as soon as
   // possible, so they can be reused for any other requests.
   CurlHandle::ReturnToPool(*factory_, std::move(handle_));
-  factory_->CleanupMultiHandle(std::move(multi_), HandleDisposition::kKeep);
+  factory_->CleanupMultiHandle(ReleaseMulti(), HandleDisposition::kKeep);
 }
 
 std::optional<std::string> CurlOptProxy(Options const& options) {

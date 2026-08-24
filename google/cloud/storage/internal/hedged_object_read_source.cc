@@ -68,6 +68,18 @@ struct RaceState {
   void CancelAll() {
     CancelAllExcept(nullptr);
   }
+
+  // Resolve the race with @p status (unless an attempt already resolved it)
+  // and cancel every attempt. Attempts do not fulfill the promise when they
+  // observe a cancelled token, so an external Cancel() or Close() must
+  // resolve the race itself or the reader blocks in `future.get()` forever.
+  void Abort(Status status) {
+    bool expected = false;
+    if (resolved.compare_exchange_strong(expected, true)) {
+      promise.set_value(RaceResult{std::move(status), nullptr, {}});
+    }
+    CancelAll();
+  }
 };
 
 namespace {
@@ -134,6 +146,21 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
     attempt_handle->source = source->get();
   }
 
+  // A `CancelAllExcept()` running between the token check above and the
+  // registration of the source saw a null `source` and could not cancel it.
+  // Re-check the token now that the source is visible, or this attempt would
+  // proceed into a blocking `Read()` that nothing can interrupt.
+  if (attempt_handle->cancel_token->load(std::memory_order_relaxed) ||
+      state->resolved.load(std::memory_order_relaxed)) {
+    {
+      std::lock_guard<std::mutex> lk(attempt_handle->mu);
+      attempt_handle->source = nullptr;
+    }
+    (*source)->Cancel();
+    (void)(*source)->Close();
+    return;
+  }
+
   StatusOr<ReadSourceResult> result = (*source)->Read(buffer.get(), n);
 
   {
@@ -192,12 +219,20 @@ StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
     std::lock_guard<std::mutex> lk(mu_);
     is_closed_ = true;
     race = current_race_;
-    child = std::move(active_child_);
+    if (reading_) {
+      // A Read() is in flight on `active_child_`: destroying the child here
+      // would leave the reader executing inside a deleted object. Unblock the
+      // reader instead; it discards the child when it returns.
+      if (active_child_) active_child_->Cancel();
+    } else {
+      child = std::move(active_child_);
+    }
+  }
+  if (race) {
+    race->Abort(google::cloud::internal::CancelledError(
+        "Stream closed while a read was in progress", GCP_ERROR_INFO()));
   }
   if (child) return child->Close();
-  if (race) {
-    race->CancelAll();
-  }
   // The source was never read from, there is no child (or HTTP response) to
   // close.
   return HttpResponse{HttpStatusCode::kOk, {}, {}};
@@ -214,13 +249,13 @@ void HedgedObjectReadSource::Cancel() {
     }
   }
   if (race) {
-    race->CancelAll();
+    race->Abort(google::cloud::internal::CancelledError("Request cancelled",
+                                                        GCP_ERROR_INFO()));
   }
 }
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
                                                         std::size_t n) {
-  ObjectReadSource* child = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (is_closed_) return ReadSourceResult{};
@@ -228,11 +263,42 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
       return google::cloud::internal::CancelledError("Request cancelled",
                                                      GCP_ERROR_INFO());
     }
+    reading_ = true;
+  }
+  auto result = ReadImpl(buf, n);
+  // While `reading_` was set, Close() deferred the destruction of
+  // `active_child_` to this thread: it cannot delete an object this thread
+  // may still be executing in. Perform any deferred cleanup now.
+  std::unique_ptr<ObjectReadSource> discard;
+  bool cancelled = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    reading_ = false;
+    if (is_closed_ || is_cancelled_) {
+      discard = std::move(active_child_);
+      cancelled = is_cancelled_;
+    }
+  }
+  if (discard) {
+    if (cancelled) discard->Cancel();
+    (void)discard->Close();
+  }
+  return result;
+}
+
+StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadImpl(char* buf,
+                                                            std::size_t n) {
+  ObjectReadSource* child = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
     // Only the stream open is hedged. Once a child has won the race all
     // subsequent reads continue on it, at its current offset, without any
     // thread hops or extra copies.
     if (active_child_) child = active_child_.get();
   }
+  // `child` remains valid outside the lock: Close() does not destroy the
+  // child while `reading_` is set, and this thread only destroys it after
+  // ReadImpl() returns.
   if (child != nullptr) return child->Read(buf, n);
 
   // Racing requires one staging buffer of `n` bytes per attempt, on top of the
@@ -241,26 +307,37 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
   // straight into the caller's buffer.
   if (n > max_buffer_) {
     auto cancel_token = std::make_shared<std::atomic<bool>>(false);
-    StatusOr<std::unique_ptr<ObjectReadSource>> child =
+    StatusOr<std::unique_ptr<ObjectReadSource>> new_child =
         child_factory_(cancel_token);
-    if (!child) return std::move(child).status();
+    if (!new_child) return std::move(new_child).status();
+    ObjectReadSource* raw = new_child->get();
+    bool installed = false;
+    bool cancelled = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      if (is_cancelled_) {
-        (*child)->Cancel();
-        (void)(*child)->Close();
+      cancelled = is_cancelled_;
+      if (!is_cancelled_ && !is_closed_) {
+        active_child_ = *std::move(new_child);
+        installed = true;
+      }
+    }
+    if (!installed) {
+      // A Cancel() or Close() raced with the open.
+      (*new_child)->Cancel();
+      (void)(*new_child)->Close();
+      if (cancelled) {
         return google::cloud::internal::CancelledError("Request cancelled",
                                                        GCP_ERROR_INFO());
       }
-      active_child_ = *std::move(child);
+      return ReadSourceResult{};
     }
-    return active_child_->Read(buf, n);
+    return raw->Read(buf, n);
   }
 
   auto state = std::make_shared<RaceState>();
   {
     std::lock_guard<std::mutex> lk(mu_);
-    if (is_cancelled_) {
+    if (is_cancelled_ || is_closed_) {
       return google::cloud::internal::CancelledError("Request cancelled",
                                                      GCP_ERROR_INFO());
     }
@@ -302,10 +379,28 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
   }
 
   RaceResult race = future.get();
+  bool closed = false;
+  bool cancelled = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     current_race_.reset();
-    active_child_ = std::move(race.source);
+    closed = is_closed_;
+    cancelled = is_cancelled_;
+    // Do not install the winner when a Close() or Cancel() raced with the
+    // attempts: the caller's Close() already returned and nothing would ever
+    // close the child.
+    if (!closed && !cancelled) active_child_ = std::move(race.source);
+  }
+  if (closed || cancelled) {
+    if (race.source) {
+      race.source->Cancel();
+      (void)race.source->Close();
+    }
+    if (cancelled) {
+      return google::cloud::internal::CancelledError("Request cancelled",
+                                                     GCP_ERROR_INFO());
+    }
+    return ReadSourceResult{};
   }
   if (race.result.ok() && race.result->bytes_received > 0) {
     std::memcpy(buf, race.buffer.get(), race.result->bytes_received);
