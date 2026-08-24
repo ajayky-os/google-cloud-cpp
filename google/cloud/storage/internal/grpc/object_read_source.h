@@ -68,6 +68,8 @@ class GrpcObjectReadSource : public storage::internal::ObjectReadSource {
   StatusOr<storage::internal::ReadSourceResult> Read(char* buf,
                                                      std::size_t n) override;
 
+  void Cancel() override;
+
  private:
   Status HandleResponse(storage::internal::ReadSourceResult& result, char* buf,
                         std::size_t n,

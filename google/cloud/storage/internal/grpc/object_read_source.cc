@@ -138,6 +138,10 @@ Status GrpcObjectReadSource::HandleResponse(
   return {};
 }
 
+void GrpcObjectReadSource::Cancel() {
+  if (stream_) stream_->Cancel();
+}
+
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace storage_internal
 }  // namespace cloud

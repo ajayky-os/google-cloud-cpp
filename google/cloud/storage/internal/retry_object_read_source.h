@@ -64,6 +64,7 @@ class RetryObjectReadSource : public ObjectReadSource {
   bool IsOpen() const override { return child_ && child_->IsOpen(); }
   StatusOr<HttpResponse> Close() override { return child_->Close(); }
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
+  void Cancel() override;
 
  private:
   bool HandleResult(StatusOr<ReadSourceResult> const& r);
@@ -81,6 +82,7 @@ class RetryObjectReadSource : public ObjectReadSource {
   OffsetDirection offset_direction_;
   std::int64_t current_offset_ = 0;
   bool is_gunzipped_ = false;
+  bool cancelled_ = false;
   std::function<void(std::chrono::milliseconds)> backoff_;
 };
 

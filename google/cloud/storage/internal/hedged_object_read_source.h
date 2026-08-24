@@ -18,9 +18,11 @@
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/object_read_source.h"
 #include "google/cloud/storage/version.h"
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace google {
 namespace cloud {
@@ -28,14 +30,16 @@ namespace storage {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
+struct RaceState;
+
 /**
  * Hedge the *open* of an `ObjectReadSource` to reduce tail latency.
  *
  * The first `Read()` races one or more children created by `child_factory`:
  * a primary attempt starts immediately, and up to @p max_hedges additional
  * attempts start, staggered by @p delay, while no attempt has completed. The
- * first attempt to complete its initial read wins; losing attempts are closed
- * when they eventually complete.
+ * first attempt to complete its initial read wins; losing attempts are cancelled
+ * and closed as soon as the winner completes.
  *
  * Only the initial open is hedged. `ObjectReadSource` is a stream, so a hedge
  * started mid-stream would restart from the request's initial offset and
@@ -44,7 +48,7 @@ namespace internal {
  * or copies.
  *
  * Each racing attempt reads into its own buffer, because a losing attempt
- * keeps writing until it completes and must not touch the caller's buffer.
+ * keeps writing until cancelled and must not touch the caller's buffer.
  * Peak memory for the race is therefore proportional to the size of the first
  * read. Reads larger than @p max_buffer are served without hedging, directly
  * into the caller's buffer, so a large read cannot multiply memory use.
@@ -52,6 +56,9 @@ namespace internal {
 class HedgedObjectReadSource : public ObjectReadSource {
  public:
   using ChildFactory =
+      std::function<StatusOr<std::unique_ptr<ObjectReadSource>>(
+          std::shared_ptr<std::atomic<bool>>)>;
+  using SimpleChildFactory =
       std::function<StatusOr<std::unique_ptr<ObjectReadSource>>()>;
 
   HedgedObjectReadSource(std::shared_ptr<HedgingThreadPool> hedge_pool,
@@ -59,11 +66,17 @@ class HedgedObjectReadSource : public ObjectReadSource {
                          std::chrono::milliseconds delay, int max_hedges,
                          std::size_t max_buffer);
 
-  ~HedgedObjectReadSource() override = default;
+  HedgedObjectReadSource(std::shared_ptr<HedgingThreadPool> hedge_pool,
+                         SimpleChildFactory child_factory,
+                         std::chrono::milliseconds delay, int max_hedges,
+                         std::size_t max_buffer);
+
+  ~HedgedObjectReadSource() override;
 
   bool IsOpen() const override;
   StatusOr<HttpResponse> Close() override;
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
+  void Cancel() override;
 
  private:
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
@@ -72,8 +85,11 @@ class HedgedObjectReadSource : public ObjectReadSource {
   int max_hedges_;
   std::size_t max_buffer_;
 
+  mutable std::mutex mu_;
   std::unique_ptr<ObjectReadSource> active_child_;
+  std::shared_ptr<RaceState> current_race_;
   bool is_closed_ = false;
+  bool is_cancelled_ = false;
 };
 
 }  // namespace internal
