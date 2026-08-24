@@ -187,12 +187,14 @@ bool HedgedObjectReadSource::IsOpen() const {
 
 StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
   std::shared_ptr<RaceState> race;
+  std::unique_ptr<ObjectReadSource> child;
   {
     std::lock_guard<std::mutex> lk(mu_);
     is_closed_ = true;
     race = current_race_;
-    if (active_child_) return active_child_->Close();
+    child = std::move(active_child_);
   }
+  if (child) return child->Close();
   if (race) {
     race->CancelAll();
   }
@@ -218,10 +220,10 @@ void HedgedObjectReadSource::Cancel() {
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
                                                         std::size_t n) {
-  if (is_closed_) return ReadSourceResult{};
-
+  ObjectReadSource* child = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (is_closed_) return ReadSourceResult{};
     if (is_cancelled_) {
       return google::cloud::internal::CancelledError("Request cancelled",
                                                      GCP_ERROR_INFO());
@@ -229,8 +231,9 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
     // Only the stream open is hedged. Once a child has won the race all
     // subsequent reads continue on it, at its current offset, without any
     // thread hops or extra copies.
-    if (active_child_) return active_child_->Read(buf, n);
+    if (active_child_) child = active_child_.get();
   }
+  if (child != nullptr) return child->Read(buf, n);
 
   // Racing requires one staging buffer of `n` bytes per attempt, on top of the
   // caller's own buffer. For a large read that multiplication is worse than
