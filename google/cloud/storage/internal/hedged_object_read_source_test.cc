@@ -465,8 +465,11 @@ TEST(HedgedObjectReadSourceTest, CancelMidStreamUnblocksRead) {
           unblock_second_read->get_future().get();
           return Status(StatusCode::kCancelled, "cancelled");
         });
-    EXPECT_CALL(*mock, Cancel).WillOnce([unblock_second_read]() {
-      unblock_second_read->set_value();
+    EXPECT_CALL(*mock, Cancel).WillRepeatedly([unblock_second_read]() {
+      try {
+        unblock_second_read->set_value();
+      } catch (std::future_error const&) {
+      }
     });
     EXPECT_CALL(*mock, Close)
         .WillRepeatedly(Return(HttpResponse{HttpStatusCode::kOk, {}, {}}));
