@@ -444,6 +444,54 @@ TEST(HedgedObjectReadSourceTest, HedgeReadFailureDoesNotAbortPrimary) {
               Eq("primary_data"));
 }
 
+TEST(HedgedObjectReadSourceTest, CancelMidStreamUnblocksRead) {
+  auto first_read_started = std::make_shared<std::promise<void>>();
+  auto second_read_started = std::make_shared<std::promise<void>>();
+  auto unblock_second_read = std::make_shared<std::promise<void>>();
+
+  HedgedObjectReadSource::ChildFactory factory =
+      [=](std::shared_ptr<std::atomic<bool>> const&)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    EXPECT_CALL(*mock, Read)
+        .WillOnce([first_read_started](char* buf, std::size_t n) {
+          first_read_started->set_value();
+          std::string const data = "chunk1";
+          std::memcpy(buf, data.data(), (std::min)(n, data.size()));
+          return MakeReadResult(data);
+        })
+        .WillOnce([second_read_started, unblock_second_read](char*, std::size_t) {
+          second_read_started->set_value();
+          unblock_second_read->get_future().get();
+          return Status(StatusCode::kCancelled, "cancelled");
+        });
+    EXPECT_CALL(*mock, Cancel).WillOnce([unblock_second_read]() {
+      unblock_second_read->set_value();
+    });
+    EXPECT_CALL(*mock, Close)
+        .WillRepeatedly(Return(HttpResponse{HttpStatusCode::kOk, {}, {}}));
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  auto source = std::make_unique<HedgedObjectReadSource>(
+      MakeUnlimitedPool(), factory, std::chrono::milliseconds(500),
+      /*max_hedges=*/0, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source->Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+
+  auto read_async = std::async(std::launch::async, [&]() {
+    return source->Read(buffer.data(), buffer.size());
+  });
+
+  second_read_started->get_future().get();
+  source->Cancel();
+
+  StatusOr<ReadSourceResult> r2 = read_async.get();
+  EXPECT_THAT(r2, StatusIs(StatusCode::kCancelled));
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

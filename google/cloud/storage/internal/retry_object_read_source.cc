@@ -70,20 +70,40 @@ RetryObjectReadSource::RetryObjectReadSource(
           [](std::chrono::milliseconds d) { std::this_thread::sleep_for(d); }) {
 }
 
+bool RetryObjectReadSource::IsOpen() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return child_ && child_->IsOpen();
+}
+
+StatusOr<HttpResponse> RetryObjectReadSource::Close() {
+  std::unique_ptr<ObjectReadSource> child;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    child = std::move(child_);
+  }
+  if (!child) return HttpResponse{HttpStatusCode::kOk, {}, {}};
+  return child->Close();
+}
+
 StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
                                                        std::size_t n) {
-  if (cancelled_) {
+  if (cancelled_.load(std::memory_order_relaxed)) {
     return google::cloud::internal::CancelledError("Request cancelled",
                                                    GCP_ERROR_INFO());
   }
 
-  if (!child_) {
-    return google::cloud::internal::FailedPreconditionError(
-        "Stream is not open", GCP_ERROR_INFO());
+  ObjectReadSource* child = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!child_) {
+      return google::cloud::internal::FailedPreconditionError(
+          "Stream is not open", GCP_ERROR_INFO());
+    }
+    child = child_.get();
   }
 
   // Read some data, if successful return immediately, saving some allocations.
-  auto result = child_->Read(buf, n);
+  auto result = child->Read(buf, n);
   if (HandleResult(result)) return result;
   bool has_emulator_instructions = false;
   std::string instructions;
@@ -98,7 +118,7 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
   auto retry_policy = retry_policy_prototype_->clone();
   int counter = 0;
   while (!result && retry_policy->OnFailure(result.status())) {
-    if (cancelled_) {
+    if (cancelled_.load(std::memory_order_relaxed)) {
       return google::cloud::internal::CancelledError("Request cancelled",
                                                      GCP_ERROR_INFO());
     }
@@ -106,7 +126,10 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
     // stalled. The current child might no longer be usable, so we will try to
     // create a new one and replace it. Should that fail, the retry policy would
     // already be exhausted, so we should fail this operation too.
-    child_.reset();
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      child_.reset();
+    }
 
     // The first attempt does not get to backoff.  The previous download was
     // working fine, so whatever caused the download to stop may not be an
@@ -133,7 +156,11 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
       result = status;
       continue;
     }
-    result = child_->Read(buf, n);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      child = child_.get();
+    }
+    result = child->Read(buf, n);
   }
   if (HandleResult(result)) return result;
   // We have exhausted the retry policy, return the error.
@@ -148,7 +175,8 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
 }
 
 void RetryObjectReadSource::Cancel() {
-  cancelled_ = true;
+  cancelled_.store(true, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(mu_);
   if (child_) child_->Cancel();
 }
 
@@ -170,6 +198,7 @@ bool RetryObjectReadSource::HandleResult(StatusOr<ReadSourceResult> const& r) {
 Status RetryObjectReadSource::MakeChild(RetryPolicy& retry_policy,
                                         BackoffPolicy& backoff_policy) {
   auto on_success = [this](std::unique_ptr<ObjectReadSource> child) {
+    std::lock_guard<std::mutex> lk(mu_);
     child_ = std::move(child);
     return Status{};
   };
@@ -177,6 +206,12 @@ Status RetryObjectReadSource::MakeChild(RetryPolicy& retry_policy,
   OptionsSpan const span(options_);
   auto child = factory_(request_, retry_policy, backoff_policy);
   if (!child) return std::move(child).status();
+  if (cancelled_.load(std::memory_order_relaxed)) {
+    (*child)->Cancel();
+    (void)(*child)->Close();
+    return google::cloud::internal::CancelledError("Request cancelled",
+                                                   GCP_ERROR_INFO());
+  }
   if (!is_gunzipped_) return on_success(*std::move(child));
 
   // Downloads under decompressive transcoding do not respect the Read-Range
