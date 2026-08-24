@@ -398,33 +398,41 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   auto const* where = __func__;
   auto factory = [self = shared_from_this(), current, where](
                      ReadObjectRangeRequest const& request,
-                     RetryPolicy& retry_policy, BackoffPolicy& backoff_policy) {
+                     RetryPolicy& retry_policy, BackoffPolicy& backoff_policy,
+                     std::shared_ptr<std::atomic<bool>> cancel_token =
+                         nullptr) {
     auto const idempotency =
         current->get<IdempotencyPolicyOption>()->IsIdempotent(request)
             ? Idempotency::kIdempotent
             : Idempotency::kNonIdempotent;
     return RestRetryLoop(
         retry_policy, backoff_policy, idempotency,
-        [self, token = self->MakeIdempotencyToken()](
+        [self, token = self->MakeIdempotencyToken(), cancel_token](
             rest_internal::RestContext& context, Options const& options,
             ReadObjectRangeRequest const& request) {
           context.AddHeader(kIdempotencyTokenHeader, token);
+          if (cancel_token) context.set_cancellation_token(cancel_token);
           return self->stub_->ReadObject(context, options, request);
         },
         *current, request, where);
   };
 
-  auto retry_source_factory =
+  HedgedObjectReadSource::ChildFactory retry_source_factory =
       [factory, current,
-       request]() -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+       request](std::shared_ptr<std::atomic<bool>> cancel_token)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     auto retry_policy = current->get<RetryPolicyOption>()->clone();
     auto backoff_policy = current->get<BackoffPolicyOption>()->clone();
-    auto child = factory(request, *retry_policy, *backoff_policy);
+    auto child = factory(request, *retry_policy, *backoff_policy, cancel_token);
     if (!child) return child;
     return std::unique_ptr<ObjectReadSource>(
         std::make_unique<RetryObjectReadSource>(
-            factory, current, request, *std::move(child),
-            std::move(retry_policy), std::move(backoff_policy)));
+            [factory, cancel_token](ReadObjectRangeRequest const& req,
+                                    RetryPolicy& rp, BackoffPolicy& bp) {
+              return factory(req, rp, bp, cancel_token);
+            },
+            current, request, *std::move(child), std::move(retry_policy),
+            std::move(backoff_policy)));
   };
 
   auto const enable_hedging =
@@ -436,7 +444,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
       current->get<storage_experimental::MaximumHedgeBufferOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_) {
-    return retry_source_factory();
+    return retry_source_factory(nullptr);
   }
 
   // `max_buffer` bounds the size of an individual read, which is only known

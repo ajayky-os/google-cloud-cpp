@@ -29,6 +29,7 @@
 #include "google/cloud/version.h"
 #include "absl/types/span.h"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -105,6 +106,10 @@ class CurlImpl {
   bool HasUnreadData() const;
   StatusOr<std::size_t> Read(absl::Span<char> output);
 
+  void SetCancellationToken(std::shared_ptr<std::atomic<bool>> token);
+  void Cancel();
+  int TransferInfoCallback();
+
   // Called from libcurl callbacks for received data.
   std::size_t WriteCallback(absl::Span<char> response);
   std::size_t HeaderCallback(absl::Span<char> response);
@@ -147,6 +152,7 @@ class CurlImpl {
   CurlHeaders request_headers_;
   CurlHandle handle_;
   CurlMulti multi_;
+  std::shared_ptr<std::atomic<bool>> cancellation_token_;
 
   bool logging_enabled_;
   bool follow_location_;

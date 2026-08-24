@@ -72,6 +72,11 @@ RetryObjectReadSource::RetryObjectReadSource(
 
 StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
                                                        std::size_t n) {
+  if (cancelled_) {
+    return google::cloud::internal::CancelledError("Request cancelled",
+                                                   GCP_ERROR_INFO());
+  }
+
   if (!child_) {
     return google::cloud::internal::FailedPreconditionError(
         "Stream is not open", GCP_ERROR_INFO());
@@ -93,6 +98,10 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
   auto retry_policy = retry_policy_prototype_->clone();
   int counter = 0;
   while (!result && retry_policy->OnFailure(result.status())) {
+    if (cancelled_) {
+      return google::cloud::internal::CancelledError("Request cancelled",
+                                                     GCP_ERROR_INFO());
+    }
     // A Read() request failed, most likely that means the connection failed or
     // stalled. The current child might no longer be usable, so we will try to
     // create a new one and replace it. Should that fail, the retry policy would
@@ -136,6 +145,11 @@ StatusOr<ReadSourceResult> RetryObjectReadSource::Read(char* buf,
     os << "Retry policy exhausted in Read(): " << status.message();
   }
   return Status(status.code(), std::move(os).str(), status.error_info());
+}
+
+void RetryObjectReadSource::Cancel() {
+  cancelled_ = true;
+  if (child_) child_->Cancel();
 }
 
 bool RetryObjectReadSource::HandleResult(StatusOr<ReadSourceResult> const& r) {

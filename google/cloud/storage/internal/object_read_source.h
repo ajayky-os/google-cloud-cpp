@@ -83,6 +83,9 @@ class ObjectReadSource {
   /// Read more data from the download, returning any HTTP headers and error
   /// codes.
   virtual StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) = 0;
+
+  /// Cancel any pending or future read operations.
+  virtual void Cancel() {}
 };
 
 /**

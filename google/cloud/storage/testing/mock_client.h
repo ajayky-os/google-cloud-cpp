@@ -187,6 +187,7 @@ class MockObjectReadSource : public internal::ObjectReadSource {
   MOCK_METHOD(StatusOr<internal::HttpResponse>, Close, (), (override));
   MOCK_METHOD(StatusOr<internal::ReadSourceResult>, Read,
               (char* buf, std::size_t n), (override));
+  MOCK_METHOD(void, Cancel, (), (override));
 };
 
 class MockStreambuf : public internal::ObjectWriteStreambuf {
