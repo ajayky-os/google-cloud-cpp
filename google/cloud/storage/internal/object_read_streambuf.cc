@@ -80,6 +80,10 @@ class OverrunLoggingObjectReadSource : public ObjectReadSource {
     return res;
   }
 
+  void Cancel() override {
+    if (child_) child_->Cancel();
+  }
+
  private:
   void CheckOverrun() {
     if (requested_length_.has_value() && *requested_length_ >= 0 &&

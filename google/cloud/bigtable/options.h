@@ -242,6 +242,28 @@ struct DirectPathMetricsModeOption {
   using Type = DirectPathMetricsMode;
 };
 
+/**
+ * Option to configure the timeout for DirectPath startup compatibility probing.
+ *
+ * Defaults to 2 seconds.
+ *
+ * @ingroup google-cloud-bigtable-options
+ */
+struct DirectPathProbeTimeoutOption {
+  using Type = std::chrono::milliseconds;
+};
+
+/**
+ * Option to configure the timeout for DirectPath diagnostics.
+ *
+ * Defaults to 5 seconds.
+ *
+ * @ingroup google-cloud-bigtable-options
+ */
+struct DirectPathDiagnosticsTimeoutOption {
+  using Type = std::chrono::milliseconds;
+};
+
 }  // namespace experimental
 
 /// The complete list of options accepted by `bigtable::*Client`

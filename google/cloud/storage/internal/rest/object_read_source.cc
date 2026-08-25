@@ -120,6 +120,10 @@ StatusOr<ReadSourceResult> RestObjectReadSource::Read(char* buf,
   return MakeRestReadResult(*read, std::move(h));
 }
 
+void RestObjectReadSource::Cancel() {
+  if (payload_) payload_->Cancel();
+}
+
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace storage

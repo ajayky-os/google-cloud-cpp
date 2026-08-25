@@ -45,6 +45,8 @@ class RestObjectReadSource : public ObjectReadSource {
 
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
 
+  void Cancel() override;
+
  private:
   google::cloud::rest_internal::HttpStatusCode status_code_;
   std::multimap<std::string, std::string> headers_;

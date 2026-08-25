@@ -20,9 +20,11 @@
 #include "google/cloud/storage/retry_policy.h"
 #include "google/cloud/storage/version.h"
 #include "google/cloud/options.h"
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace google {
@@ -61,9 +63,10 @@ class RetryObjectReadSource : public ObjectReadSource {
                         std::unique_ptr<RetryPolicy> retry_policy,
                         std::unique_ptr<BackoffPolicy> backoff_policy);
 
-  bool IsOpen() const override { return child_ && child_->IsOpen(); }
-  StatusOr<HttpResponse> Close() override { return child_->Close(); }
+  bool IsOpen() const override;
+  StatusOr<HttpResponse> Close() override;
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
+  void Cancel() override;
 
  private:
   bool HandleResult(StatusOr<ReadSourceResult> const& r);
@@ -74,6 +77,7 @@ class RetryObjectReadSource : public ObjectReadSource {
   ReadSourceFactory factory_;
   google::cloud::internal::ImmutableOptions options_;
   ReadObjectRangeRequest request_;
+  mutable std::mutex mu_;
   std::unique_ptr<ObjectReadSource> child_;
   std::optional<std::int64_t> generation_;
   std::unique_ptr<RetryPolicy const> retry_policy_prototype_;
@@ -81,6 +85,12 @@ class RetryObjectReadSource : public ObjectReadSource {
   OffsetDirection offset_direction_;
   std::int64_t current_offset_ = 0;
   bool is_gunzipped_ = false;
+  // Guarded by `mu_`. `reading_` is true while a Read() is in flight; while
+  // set, Close() must not destroy `child_` (the reader may be executing
+  // inside it) and instead defers the cleanup to the reader.
+  bool closed_ = false;
+  bool reading_ = false;
+  std::atomic<bool> cancelled_{false};
   std::function<void(std::chrono::milliseconds)> backoff_;
 };
 
