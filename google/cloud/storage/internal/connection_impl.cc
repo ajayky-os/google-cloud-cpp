@@ -420,17 +420,22 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
         *current, request, where);
   };
 
-  OffsetDirection const offset_direction = request.HasOption<ReadLast>()
-                                               ? kFromEnd
-                                               : kFromBeginning;
-  std::int64_t const initial_offset =
-      offset_direction == kFromEnd ? request.GetOption<ReadLast>().value()
-                                   : request.StartingByte();
-  std::optional<std::int64_t> generation;
+  HedgedObjectReadSource::Position position;
+  position.direction =
+      request.HasOption<ReadLast>() ? kFromEnd : kFromBeginning;
+  position.offset = position.direction == kFromEnd
+                        ? request.GetOption<ReadLast>().value()
+                        : request.StartingByte();
+  if (request.HasOption<ReadRange>()) {
+    position.end_offset = request.GetOption<ReadRange>().value().end;
+  }
   if (request.HasOption<Generation>()) {
-    generation = request.GetOption<Generation>().value();
+    position.generation = request.GetOption<Generation>().value();
   }
 
+  // Creates a `RetryObjectReadSource` positioned at `current_offset`, this is
+  // the same request rewrite `RetryObjectReadSource` applies when it resumes
+  // after a failure.
   auto child_factory =
       [factory, current, request](std::int64_t current_offset,
                                   std::optional<std::int64_t> generation)
@@ -464,7 +469,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
       current->get<storage_experimental::MaximumHedgeBufferOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_ || !read_pool_) {
-    return child_factory(initial_offset, generation);
+    return child_factory(position.offset, position.generation);
   }
 
   // `max_buffer` bounds the size of an individual read, which is only known
@@ -472,7 +477,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   return std::unique_ptr<ObjectReadSource>(
       std::make_unique<HedgedObjectReadSource>(
           read_pool_, hedge_pool_, std::move(child_factory), delay, max_hedges,
-          max_buffer, initial_offset, offset_direction, generation));
+          max_buffer, position));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(

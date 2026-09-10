@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
+#include "google/cloud/storage/retry_policy.h"
 #include "google/cloud/internal/make_status.h"
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -31,60 +33,86 @@ struct RaceResult {
   StatusOr<ReadSourceResult> result;
   std::unique_ptr<ObjectReadSource> source;
   std::unique_ptr<char[]> buffer;
+  std::size_t buffer_capacity = 0;
 };
 
+// Shared between the caller, which schedules the attempts and waits for the
+// winner, and the attempts themselves, which may outlive the caller's wait.
 struct RaceState {
   std::promise<RaceResult> promise;
   std::atomic<bool> resolved{false};
   std::atomic<int> active_attempts{0};
+
+  // The primary attempt reads from the active child (if any) into the staging
+  // buffer kept from the previous race (if large enough). Both are consumed
+  // by the primary attempt when it starts.
+  std::unique_ptr<ObjectReadSource> primary_child;
+  std::unique_ptr<char[]> primary_buffer;
+  std::size_t primary_buffer_capacity = 0;
+
   std::mutex mu;
-  Status last_error;
+  Status primary_error;  // GUARDED_BY(mu)
+  Status last_error;     // GUARDED_BY(mu)
+
+  // Returns true for exactly one caller: the one that gets to set the result.
+  bool TryClaim() {
+    bool expected = false;
+    return resolved.compare_exchange_strong(expected, true);
+  }
+
+  // The error reported when every attempt fails. The primary describes the
+  // stream the caller is actually reading, so its error takes precedence over
+  // whatever a hedge happened to fail with last.
+  Status FinalError() {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!primary_error.ok()) return primary_error;
+    return last_error;
+  }
+
+  // Called once for every attempt that ends without a result: an open error,
+  // a read error, or a hedge that could not be dispatched. The last attempt
+  // to retire resolves the race with the collected error.
+  void RetireAttempt() {
+    if (active_attempts.fetch_sub(1) != 1) return;
+    if (!TryClaim()) return;
+    promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+  }
+
+  void Fail(Status status, bool is_primary) {
+    auto const permanent =
+        is_primary && StatusTraits::IsPermanentFailure(status);
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      if (is_primary) {
+        primary_error = std::move(status);
+      } else {
+        last_error = std::move(status);
+      }
+    }
+    // A hedge cannot fix a permanent error on the primary (the object is gone,
+    // access is denied, ...). Report it now instead of holding the caller
+    // until every in-flight hedge has exhausted its own retry budget.
+    if (permanent && TryClaim()) {
+      promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+    }
+    RetireAttempt();
+  }
 };
 
-void ResolveOnError(std::shared_ptr<RaceState> const& state, Status status) {
-  {
-    std::lock_guard<std::mutex> lock(state->mu);
-    state->last_error = std::move(status);
-  }
-  if (state->active_attempts.fetch_sub(1) == 1) {
-    bool expected = false;
-    if (state->resolved.compare_exchange_strong(expected, true)) {
-      Status error;
-      {
-        std::lock_guard<std::mutex> lock(state->mu);
-        error = std::move(state->last_error);
-      }
-      state->promise.set_value(RaceResult{std::move(error), nullptr, nullptr});
-    }
-  }
-}
-
-void ResolveOnSuccess(std::shared_ptr<RaceState> const& state,
-                      StatusOr<ReadSourceResult> result,
-                      std::unique_ptr<ObjectReadSource> source,
-                      std::unique_ptr<char[]> buffer) {
-  bool expected = false;
-  if (state->resolved.compare_exchange_strong(expected, true)) {
-    state->promise.set_value(RaceResult{std::move(result), std::move(source),
-                                        std::move(buffer)});
-  } else {
-    source->Close();
-  }
-}
-
-// Runs a single read attempt. If child is provided, it reads from that existing
-// source (e.g. primary attempt on an established connection). Otherwise, it
-// opens a new child at @p offset and @p generation via @p factory.
-// Successful reads resolve the race immediately. Failing attempts only resolve
-// the race if all other active attempts have also completed and failed.
+// Runs a single read attempt. The primary attempt reads from the active child
+// when the stream has one, any other attempt opens a new child at @p offset
+// and @p generation. A successful read resolves the race immediately; the
+// loser closes its own child. A failed attempt only resolves the race if it
+// is the last one standing, or if it is the primary failing permanently.
 void RunAttempt(std::shared_ptr<RaceState> const& state,
                 HedgedObjectReadSource::ChildFactory const& factory,
                 std::unique_ptr<ObjectReadSource> child,
-                std::unique_ptr<char[]> buffer, std::int64_t offset,
-                std::optional<std::int64_t> generation, std::size_t n,
+                std::unique_ptr<char[]> buffer, std::size_t buffer_capacity,
+                std::int64_t offset, std::optional<std::int64_t> generation,
+                std::size_t n, bool is_primary,
                 std::shared_ptr<HedgingThreadPool> release_slot) {
   // Releases the acquired hedge concurrency slot upon function exit across
-  // all code paths. For primary attempts, release_slot is nullptr.
+  // all code paths. For the primary attempt, release_slot is nullptr.
   struct SlotGuard {
     std::shared_ptr<HedgingThreadPool> pool;
     ~SlotGuard() {
@@ -93,34 +121,38 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   } guard{std::move(release_slot)};
 
   if (!child) {
-    StatusOr<std::unique_ptr<ObjectReadSource>> source =
-        factory(offset, generation);
-    if (!source) {
-      ResolveOnError(state, std::move(source).status());
-      return;
-    }
+    auto source = factory(offset, generation);
+    if (!source) return state->Fail(std::move(source).status(), is_primary);
     child = *std::move(source);
   }
 
   if (!buffer) {
     buffer.reset(new (std::nothrow) char[n]);
     if (!buffer) {
-      ResolveOnError(state, google::cloud::internal::ResourceExhaustedError(
-                                "Out of memory allocating hedge buffer",
-                                GCP_ERROR_INFO()));
-      return;
+      return state->Fail(google::cloud::internal::ResourceExhaustedError(
+                             "Out of memory allocating hedge buffer",
+                             GCP_ERROR_INFO()),
+                         is_primary);
     }
+    buffer_capacity = n;
   }
 
-  StatusOr<ReadSourceResult> result = child->Read(buffer.get(), n);
-  if (!result.ok()) {
+  auto result = child->Read(buffer.get(), n);
+  if (!result) {
+    // A child that failed may have already torn down its connection, e.g. a
+    // `RetryObjectReadSource` that exhausted its retry policy has no child of
+    // its own to close.
+    if (child->IsOpen()) child->Close();
+    return state->Fail(std::move(result).status(), is_primary);
+  }
+
+  if (!state->TryClaim()) {
+    // Lost the race, the winner's data was already returned to the caller.
     child->Close();
-    ResolveOnError(state, std::move(result).status());
     return;
   }
-
-  ResolveOnSuccess(state, std::move(result), std::move(child),
-                   std::move(buffer));
+  state->promise.set_value(RaceResult{std::move(result), std::move(child),
+                                      std::move(buffer), buffer_capacity});
 }
 
 }  // namespace
@@ -129,17 +161,18 @@ HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
     std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
     std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer,
-    std::int64_t current_offset, OffsetDirection offset_direction,
-    std::optional<std::int64_t> generation)
+    Position position)
     : read_pool_(std::move(read_pool)),
       hedge_pool_(std::move(hedge_pool)),
-      child_factory_(std::move(child_factory)),
+      child_factory_(
+          std::make_shared<ChildFactory const>(std::move(child_factory))),
       delay_(delay),
       max_hedges_(max_hedges),
       max_buffer_(max_buffer),
-      current_offset_(current_offset),
-      offset_direction_(offset_direction),
-      generation_(generation) {}
+      current_offset_(position.offset),
+      offset_direction_(position.direction),
+      end_offset_(position.end_offset),
+      generation_(position.generation) {}
 
 HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
@@ -147,20 +180,7 @@ HedgedObjectReadSource::HedgedObjectReadSource(
     std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer)
     : HedgedObjectReadSource(std::move(read_pool), std::move(hedge_pool),
                              std::move(child_factory), delay, max_hedges,
-                             max_buffer, /*current_offset=*/0,
-                             /*offset_direction=*/kFromBeginning,
-                             /*generation=*/std::nullopt) {}
-
-HedgedObjectReadSource::HedgedObjectReadSource(
-    std::shared_ptr<ThreadPool> read_pool,
-    std::shared_ptr<HedgingThreadPool> hedge_pool,
-    SimpleChildFactory child_factory, std::chrono::milliseconds delay,
-    int max_hedges, std::size_t max_buffer)
-    : HedgedObjectReadSource(
-          std::move(read_pool), std::move(hedge_pool),
-          [f = std::move(child_factory)](
-              std::int64_t, std::optional<std::int64_t>) { return f(); },
-          delay, max_hedges, max_buffer) {}
+                             max_buffer, Position{}) {}
 
 bool HedgedObjectReadSource::IsOpen() const {
   if (active_child_) return active_child_->IsOpen();
@@ -175,87 +195,78 @@ StatusOr<HttpResponse> HedgedObjectReadSource::Close() {
   return HttpResponse{HttpStatusCode::kOk, {}, {}};
 }
 
-void HedgedObjectReadSource::UpdateState(
-    StatusOr<ReadSourceResult> const& result) {
-  if (!result) return;
-  if (result->generation) generation_ = result->generation;
-  if (result->transformation.value_or("") == "gunzipped") {
-    is_gunzipped_ = true;
-    offset_direction_ = kFromBeginning;
-  }
-  if (offset_direction_ == kFromEnd) {
-    current_offset_ -= static_cast<std::int64_t>(result->bytes_received);
-  } else {
-    current_offset_ += static_cast<std::int64_t>(result->bytes_received);
-  }
-}
-
 StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
                                                         std::size_t n) {
   if (is_closed_) {
     return ReadSourceResult{0, HttpResponse{HttpStatusCode::kOk, {}, {}}};
   }
+  auto const start = std::chrono::steady_clock::now();
+  auto result = ShouldRace(n) ? ReadRaced(buf, n) : ReadDirect(buf, n);
+  last_read_stalled_ = std::chrono::steady_clock::now() - start > delay_;
+  UpdateState(result);
+  return result;
+}
 
-  // Decompressive transcoding does not respect byte ranges (HTTP 206).
-  // Mid-stream hedging would have to re-read and discard from offset 0, which
+bool HedgedObjectReadSource::ShouldRace(std::size_t n) const {
+  if (max_hedges_ <= 0 || !read_pool_ || !hedge_pool_) return false;
+  // Racing stages one copy of `n` bytes per attempt on top of the caller's
+  // buffer. For a large read that multiplication is worse than the tail
+  // latency it avoids.
+  if (n > max_buffer_) return false;
+  // The stream open is always raced, that is where most tail latency lives.
+  if (!active_child_) return true;
+  // Decompressive transcoding does not respect byte ranges (HTTP 206). A
+  // mid-stream hedge would have to re-read and discard from offset 0, which
   // is worse than reading directly on the active child.
-  if (is_gunzipped_) {
-    if (!active_child_) {
-      StatusOr<std::unique_ptr<ObjectReadSource>> child =
-          child_factory_(current_offset_, generation_);
-      if (!child) return std::move(child).status();
-      active_child_ = *std::move(child);
-    }
-    StatusOr<ReadSourceResult> result = active_child_->Read(buf, n);
-    UpdateState(result);
-    return result;
-  }
+  if (is_gunzipped_) return false;
+  // The caller drains a stream with one more read at the end of the requested
+  // data. A hedge there would request an empty or inverted range, and could
+  // even win the race with bytes from the wrong offset.
+  if (AtEnd()) return false;
+  // Otherwise only re-race a stream that has shown signs of stalling, so a
+  // healthy stream keeps the zero-cost direct path.
+  return last_read_stalled_;
+}
 
-  // Large reads avoid the extra memory overhead of staging buffers per racing
-  // attempt and read directly into the caller's buffer.
-  if (n > max_buffer_) {
-    if (!active_child_) {
-      StatusOr<std::unique_ptr<ObjectReadSource>> child =
-          child_factory_(current_offset_, generation_);
-      if (!child) return std::move(child).status();
-      active_child_ = *std::move(child);
-    }
-    StatusOr<ReadSourceResult> result = active_child_->Read(buf, n);
-    UpdateState(result);
-    return result;
-  }
+bool HedgedObjectReadSource::AtEnd() const {
+  if (offset_direction_ == kFromEnd) return current_offset_ <= 0;
+  if (end_offset_ && current_offset_ >= *end_offset_) return true;
+  return size_ && current_offset_ >= static_cast<std::int64_t>(*size_);
+}
 
-  if (max_hedges_ <= 0 || !read_pool_ || !hedge_pool_) {
-    if (!active_child_) {
-      StatusOr<std::unique_ptr<ObjectReadSource>> child =
-          child_factory_(current_offset_, generation_);
-      if (!child) return std::move(child).status();
-      active_child_ = *std::move(child);
+StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadDirect(char* buf,
+                                                              std::size_t n) {
+  if (!active_child_) {
+    auto child = (*child_factory_)(current_offset_, generation_);
+    if (!child) {
+      // The stream never opened, there is nothing to read from or to close.
+      is_closed_ = true;
+      return std::move(child).status();
     }
-    StatusOr<ReadSourceResult> result = active_child_->Read(buf, n);
-    UpdateState(result);
-    return result;
+    active_child_ = *std::move(child);
   }
+  return active_child_->Read(buf, n);
+}
 
+StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
+                                                             std::size_t n) {
   auto state = std::make_shared<RaceState>();
   auto future = state->promise.get_future();
   state->active_attempts.store(1);
-
-  std::unique_ptr<char[]> primary_buf;
-  if (primary_buffer_ && primary_buffer_capacity_ >= n) {
-    primary_buf = std::move(primary_buffer_);
+  state->primary_child = std::move(active_child_);
+  if (staging_buffer_capacity_ >= n) {
+    state->primary_buffer = std::move(staging_buffer_);
+    state->primary_buffer_capacity = staging_buffer_capacity_;
   }
+  staging_buffer_.reset();
+  staging_buffer_capacity_ = 0;
 
-  auto child_holder =
-      std::make_shared<std::unique_ptr<ObjectReadSource>>(
-          std::move(active_child_));
-  auto buf_holder =
-      std::make_shared<std::unique_ptr<char[]>>(std::move(primary_buf));
-
-  auto primary = [state, factory = child_factory_, child_holder, buf_holder,
-                  offset = current_offset_, gen = generation_, n]() {
-    RunAttempt(state, factory, std::move(*child_holder), std::move(*buf_holder),
-               offset, gen, n, nullptr);
+  auto primary = [state, factory = child_factory_, offset = current_offset_,
+                  gen = generation_, n] {
+    RunAttempt(state, *factory, std::move(state->primary_child),
+               std::move(state->primary_buffer),
+               state->primary_buffer_capacity, offset, gen, n,
+               /*is_primary=*/true, nullptr);
   };
   // The primary attempt is scheduled on the dedicated read pool.
   // If the pool is shutting down run the attempt inline, the read must
@@ -278,24 +289,14 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
     }
     state->active_attempts.fetch_add(1);
     auto hedge = [state, factory = child_factory_, offset = current_offset_,
-                  gen = generation_, n, pool = hedge_pool_]() {
-      RunAttempt(state, factory, /*child=*/nullptr, /*buffer=*/nullptr, offset,
-                 gen, n, pool);
+                  gen = generation_, n, pool = hedge_pool_] {
+      RunAttempt(state, *factory, /*child=*/nullptr, /*buffer=*/nullptr,
+                 /*buffer_capacity=*/0, offset, gen, n, /*is_primary=*/false,
+                 pool);
     };
     if (!hedge_pool_->Enqueue(hedge)) {
       hedge_pool_->ReleaseHedgeSlot();
-      if (state->active_attempts.fetch_sub(1) == 1) {
-        bool expected = false;
-        if (state->resolved.compare_exchange_strong(expected, true)) {
-          Status error;
-          {
-            std::lock_guard<std::mutex> lock(state->mu);
-            error = std::move(state->last_error);
-          }
-          state->promise.set_value(
-              RaceResult{std::move(error), nullptr, nullptr});
-        }
-      }
+      state->RetireAttempt();
       break;
     }
     ++hedges_dispatched;
@@ -303,15 +304,44 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
 
   RaceResult race = future.get();
   active_child_ = std::move(race.source);
-  if (race.result.ok()) {
-    UpdateState(race.result);
-    if (race.result->bytes_received > 0) {
-      std::memcpy(buf, race.buffer.get(), race.result->bytes_received);
-    }
-    primary_buffer_ = std::move(race.buffer);
-    primary_buffer_capacity_ = n;
+  if (!race.result) {
+    // Every attempt failed and closed its own child, there is nothing left to
+    // read from or to close.
+    is_closed_ = true;
+    return std::move(race.result).status();
   }
+  if (race.result->bytes_received > 0) {
+    std::memcpy(buf, race.buffer.get(), race.result->bytes_received);
+  }
+  staging_buffer_ = std::move(race.buffer);
+  staging_buffer_capacity_ = race.buffer_capacity;
   return race.result;
+}
+
+void HedgedObjectReadSource::UpdateState(
+    StatusOr<ReadSourceResult> const& result) {
+  if (!result) return;
+  if (result->generation) generation_ = result->generation;
+  if (result->size && !size_) size_ = result->size;
+  if (result->transformation.value_or("") == "gunzipped") {
+    is_gunzipped_ = true;
+    // Decompressive transcoding does not respect `ReadLast()`, the response is
+    // the whole object from the first byte.
+    offset_direction_ = kFromBeginning;
+  }
+  auto const received = static_cast<std::int64_t>(result->bytes_received);
+  if (offset_direction_ == kFromEnd) {
+    // `ReadLast(N)` with `N` larger than the object returns the whole object.
+    // The bytes still to read are then bounded by the object size, not by
+    // `N`, otherwise a hedge opened with the remaining count would cover the
+    // whole object again and return data from the first byte.
+    if (size_ && current_offset_ > static_cast<std::int64_t>(*size_)) {
+      current_offset_ = static_cast<std::int64_t>(*size_);
+    }
+    current_offset_ -= received;
+  } else {
+    current_offset_ += received;
+  }
 }
 
 }  // namespace internal
