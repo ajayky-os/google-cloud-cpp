@@ -203,6 +203,7 @@ int main(int argc, char* argv[]) {
   int stall_timeout_secs = (argc >= 10) ? std::stoi(argv[9]) : 0;
   std::size_t chunk_size_bytes =
       (argc >= 11) ? std::stoull(argv[10]) : (1024 * 1024ULL);
+  int hedge_pool_size = (argc >= 12) ? std::stoi(argv[11]) : 30;
 
   std::vector<std::int64_t> target_sizes = ParseSizes(sizes_arg);
 
@@ -213,7 +214,9 @@ int main(int argc, char* argv[]) {
           .set<google::cloud::storage_experimental::ReadHedgeDelayOption>(
               std::chrono::milliseconds(hedge_delay_ms))
           .set<google::cloud::storage_experimental::MaxConcurrentHedgesOption>(
-              concurrency)
+              hedge_pool_size)
+          .set<google::cloud::storage_experimental::HedgingThreadPoolSizeOption>(
+              static_cast<std::size_t>(hedge_pool_size))
           .set<google::cloud::storage_experimental::HttpConnectTimeoutOption>(
               std::chrono::milliseconds(1000))
           .set<google::cloud::storage_experimental::MaximumHedgeBufferOption>(
@@ -222,7 +225,8 @@ int main(int argc, char* argv[]) {
               gcs::ExponentialBackoffPolicy(std::chrono::milliseconds(1),
                                             std::chrono::milliseconds(2), 2.0)
                   .clone())
-          .set<gcs::ConnectionPoolSizeOption>(concurrency * 2);
+          .set<gcs::ConnectionPoolSizeOption>(
+              (std::max)(concurrency * 2, hedge_pool_size * 2));
 
   if (stall_timeout_secs > 0) {
     options.set<gcs::DownloadStallTimeoutOption>(
@@ -261,6 +265,7 @@ int main(int argc, char* argv[]) {
   std::cout << "Hedging Enabled: " << (enable_hedging ? "Yes" : "No") << "\n";
   if (enable_hedging) {
     std::cout << "Hedge Delay:     " << hedge_delay_ms << " ms\n";
+    std::cout << "Hedge Pool Size: " << hedge_pool_size << " threads\n";
   }
   if (stall_timeout_secs > 0) {
     std::cout << "Stall Timeout:   " << stall_timeout_secs << " sec\n";
