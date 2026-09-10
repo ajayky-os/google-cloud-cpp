@@ -15,11 +15,14 @@
 #include "google/cloud/storage/client.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +31,8 @@ namespace gcs = ::google::cloud::storage;
 
 struct LatencyRecord {
   std::chrono::system_clock::time_point timestamp;
+  std::int64_t size_bytes;
+  std::int64_t offset;
   std::chrono::microseconds open_duration;
   std::chrono::microseconds read_duration;
   std::chrono::microseconds total_duration;
@@ -63,12 +68,8 @@ void PrintPercentiles(std::string const& label,
   std::cout << "  Max:   " << (latencies.back().count() / 1000.0) << " ms\n";
 }
 
-void PrintStats(std::vector<LatencyRecord>& records) {
-  if (records.empty()) {
-    std::cout << "No records.\n";
-    return;
-  }
-
+void PrintGroupStats(std::string const& title,
+                     std::vector<LatencyRecord> const& records) {
   std::vector<std::chrono::microseconds> total_latencies;
   std::vector<std::chrono::microseconds> open_latencies;
   std::vector<std::chrono::microseconds> read_latencies;
@@ -94,7 +95,7 @@ void PrintStats(std::vector<LatencyRecord>& records) {
     }
   }
 
-  std::cout << "\n================ Benchmark Summary ================\n";
+  std::cout << "\n================ " << title << " ================\n";
   std::cout << "Total Requests:      " << records.size() << "\n";
   std::cout << "Successful Requests: " << success_count << "\n";
   std::cout << "Failed Requests:     " << failure_count << "\n";
@@ -106,6 +107,31 @@ void PrintStats(std::vector<LatencyRecord>& records) {
   std::cout << "===================================================\n";
 }
 
+void PrintStats(std::vector<LatencyRecord> const& records,
+                std::vector<std::int64_t> const& target_sizes) {
+  if (records.empty()) {
+    std::cout << "No records.\n";
+    return;
+  }
+
+  PrintGroupStats("Overall Summary", records);
+
+  if (target_sizes.size() > 1) {
+    for (std::int64_t size : target_sizes) {
+      std::vector<LatencyRecord> group;
+      for (auto const& r : records) {
+        if (r.size_bytes == size) {
+          group.push_back(r);
+        }
+      }
+      std::ostringstream ss;
+      ss << "Size Breakdown: " << (size / (1024 * 1024)) << "MB (" << size
+         << " bytes)";
+      PrintGroupStats(ss.str(), group);
+    }
+  }
+}
+
 void WriteCsv(std::string const& filename,
               std::vector<LatencyRecord> const& records) {
   std::ofstream out(filename);
@@ -113,13 +139,14 @@ void WriteCsv(std::string const& filename,
     std::cerr << "Error: Could not open " << filename << " for writing CSV.\n";
     return;
   }
-  out << "Timestamp_ms,Open_ms,Read_ms,Total_ms,MaxChunk_ms,Chunks,Success,"
-         "StatusCode\n";
+  out << "Timestamp_ms,Size_bytes,Offset,Open_ms,Read_ms,Total_ms,MaxChunk_ms,"
+         "Chunks,Success,StatusCode\n";
   for (auto const& r : records) {
     auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      r.timestamp.time_since_epoch())
                      .count();
-    out << ts_ms << "," << (r.open_duration.count() / 1000.0) << ","
+    out << ts_ms << "," << r.size_bytes << "," << r.offset << ","
+        << (r.open_duration.count() / 1000.0) << ","
         << (r.read_duration.count() / 1000.0) << ","
         << (r.total_duration.count() / 1000.0) << ","
         << (r.max_chunk_duration.count() / 1000.0) << "," << r.chunks_count
@@ -128,11 +155,38 @@ void WriteCsv(std::string const& filename,
   std::cout << "\nRaw latencies written to " << filename << "\n";
 }
 
+std::vector<std::int64_t> ParseSizes(std::string const& str) {
+  std::vector<std::int64_t> sizes;
+  std::stringstream ss(str);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    if (item.empty()) continue;
+    std::string upper = item;
+    for (char& c : upper) c = static_cast<char>(std::toupper(c));
+    std::int64_t multiplier = 1;
+    if (upper.size() >= 2 && upper.substr(upper.size() - 2) == "MB") {
+      multiplier = 1024 * 1024;
+      upper = upper.substr(0, upper.size() - 2);
+    } else if (upper.size() >= 2 && upper.substr(upper.size() - 2) == "KB") {
+      multiplier = 1024;
+      upper = upper.substr(0, upper.size() - 2);
+    } else if (upper.size() >= 2 && upper.substr(upper.size() - 2) == "GB") {
+      multiplier = 1024 * 1024 * 1024LL;
+      upper = upper.substr(0, upper.size() - 2);
+    }
+    sizes.push_back(std::stoll(upper) * multiplier);
+  }
+  if (sizes.empty()) {
+    sizes.push_back(50 * 1024 * 1024LL);
+  }
+  return sizes;
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 4) {
     std::cerr << "Usage: " << argv[0]
               << " <bucket_name> <object_name> <duration_minutes> "
-                 "[concurrency] [read_size_bytes] [csv_output] "
+                 "[concurrency] [read_sizes] [csv_output] "
                  "[enable_hedging] [hedge_delay_ms] [stall_timeout_secs] "
                  "[chunk_size_bytes]\n";
     return 1;
@@ -141,15 +195,16 @@ int main(int argc, char* argv[]) {
   std::string bucket_name = argv[1];
   std::string object_name = argv[2];
   double duration_minutes = std::stod(argv[3]);
-  int concurrency = (argc >= 5) ? std::stoi(argv[4]) : 10;
-  long long read_size_bytes =
-      (argc >= 6) ? std::stoll(argv[5]) : (50 * 1024 * 1024LL);
+  int concurrency = (argc >= 5) ? std::stoi(argv[4]) : 15;
+  std::string sizes_arg = (argc >= 6) ? argv[5] : "2MB,3MB,5MB";
   std::string csv_filename = (argc >= 7) ? argv[6] : "raw_latencies.csv";
   bool enable_hedging = (argc >= 8) ? (std::stoi(argv[7]) != 0) : true;
   int hedge_delay_ms = (argc >= 9) ? std::stoi(argv[8]) : 500;
-  int stall_timeout_secs = (argc >= 10) ? std::stoi(argv[9]) : 1;
+  int stall_timeout_secs = (argc >= 10) ? std::stoi(argv[9]) : 0;
   std::size_t chunk_size_bytes =
       (argc >= 11) ? std::stoull(argv[10]) : (1024 * 1024ULL);
+
+  std::vector<std::int64_t> target_sizes = ParseSizes(sizes_arg);
 
   auto options =
       google::cloud::Options{}
@@ -158,7 +213,7 @@ int main(int argc, char* argv[]) {
           .set<google::cloud::storage_experimental::ReadHedgeDelayOption>(
               std::chrono::milliseconds(hedge_delay_ms))
           .set<google::cloud::storage_experimental::MaxConcurrentHedgesOption>(
-              concurrency / 2 > 0 ? concurrency / 2 : 1)
+              concurrency)
           .set<google::cloud::storage_experimental::HttpConnectTimeoutOption>(
               std::chrono::milliseconds(1000))
           .set<google::cloud::storage_experimental::MaximumHedgeBufferOption>(
@@ -179,6 +234,15 @@ int main(int argc, char* argv[]) {
 
   auto client = gcs::Client(options);
 
+  std::int64_t object_size = 524288000LL;
+  auto meta = client.GetObjectMetadata(bucket_name, object_name);
+  if (meta) {
+    object_size = static_cast<std::int64_t>(meta->size());
+  } else {
+    std::cout << "Warning: Could not fetch object metadata (" << meta.status()
+              << "), defaulting object size to " << object_size << " bytes.\n";
+  }
+
   std::vector<LatencyRecord> all_records;
   std::mutex records_mutex;
   std::atomic<int> total_iterations{0};
@@ -187,11 +251,12 @@ int main(int argc, char* argv[]) {
             << object_name << "\n";
   std::cout << "Target Duration: " << duration_minutes << " minutes\n";
   std::cout << "Concurrency:     " << concurrency << " workers\n";
-  std::cout << "Read Size:       "
-            << (read_size_bytes > 0
-                    ? std::to_string(read_size_bytes) + " bytes"
-                    : "Full Object")
-            << "\n";
+  std::cout << "Object Size:     " << object_size << " bytes\n";
+  std::cout << "Read Sizes:      ";
+  for (std::size_t i = 0; i < target_sizes.size(); ++i) {
+    std::cout << target_sizes[i] << " bytes"
+              << (i + 1 < target_sizes.size() ? ", " : "\n");
+  }
   std::cout << "Chunk Size:      " << chunk_size_bytes << " bytes\n";
   std::cout << "Hedging Enabled: " << (enable_hedging ? "Yes" : "No") << "\n";
   if (enable_hedging) {
@@ -208,11 +273,15 @@ int main(int argc, char* argv[]) {
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::duration<double, std::ratio<60>>(duration_minutes));
 
-  auto worker_func = [&]() {
+  auto worker_func = [&](int thread_id) {
     std::vector<LatencyRecord> local_records;
-    local_records.reserve(static_cast<std::size_t>(duration_minutes * 60 * 10));
+    local_records.reserve(
+        static_cast<std::size_t>(duration_minutes * 60 * 100));
 
     std::vector<char> buffer(chunk_size_bytes);
+    std::mt19937_64 rng(std::random_device{}() + thread_id * 10007);
+    std::uniform_int_distribution<std::size_t> size_dist(
+        0, target_sizes.size() - 1);
 
     while (true) {
       auto now = std::chrono::steady_clock::now();
@@ -220,27 +289,30 @@ int main(int argc, char* argv[]) {
         break;
       }
 
+      std::int64_t const req_size = target_sizes[size_dist(rng)];
+      std::int64_t const max_offset =
+          std::max<std::int64_t>(0, object_size - req_size);
+      std::uniform_int_distribution<std::int64_t> offset_dist(0, max_offset);
+      std::int64_t const req_offset = offset_dist(rng);
+
       auto start = std::chrono::steady_clock::now();
       auto start_system = std::chrono::system_clock::now();
 
-      gcs::ObjectReadStream stream;
-      if (read_size_bytes > 0) {
-        stream = client.ReadObject(bucket_name, object_name,
-                                   gcs::ReadRange(0, read_size_bytes));
-      } else {
-        stream = client.ReadObject(bucket_name, object_name);
-      }
+      auto stream = client.ReadObject(
+          bucket_name, object_name,
+          gcs::ReadRange(req_offset, req_offset + req_size));
 
       auto end_open = std::chrono::steady_clock::now();
+      auto open_dur = std::chrono::duration_cast<std::chrono::microseconds>(
+          end_open - start);
 
       if (!stream) {
         auto end_err = std::chrono::steady_clock::now();
-        auto open_dur = std::chrono::duration_cast<std::chrono::microseconds>(
-            end_open - start);
         auto total_dur = std::chrono::duration_cast<std::chrono::microseconds>(
             end_err - start);
         local_records.push_back(
-            {start_system, open_dur, std::chrono::microseconds(0), total_dur,
+            {start_system, req_size, req_offset, open_dur,
+             std::chrono::microseconds(0), total_dur,
              std::chrono::microseconds(0), 0, false,
              google::cloud::StatusCodeToString(stream.status().code())});
         continue;
@@ -273,32 +345,24 @@ int main(int argc, char* argv[]) {
       }
 
       auto end_read = std::chrono::steady_clock::now();
-
-      auto open_dur = std::chrono::duration_cast<std::chrono::microseconds>(
-          end_open - start);
       auto read_dur = std::chrono::duration_cast<std::chrono::microseconds>(
           end_read - end_open);
       auto total_dur = std::chrono::duration_cast<std::chrono::microseconds>(
           end_read - start);
 
-      if (read_failed) {
-        local_records.push_back(
-            {start_system, open_dur, read_dur, total_dur, max_chunk_dur,
-             chunks_count, false,
-             google::cloud::StatusCodeToString(stream.status().code())});
-        continue;
-      }
+      local_records.push_back(
+          {start_system, req_size, req_offset, open_dur, read_dur, total_dur,
+           max_chunk_dur, chunks_count, !read_failed,
+           read_failed
+               ? google::cloud::StatusCodeToString(stream.status().code())
+               : "OK"});
 
-      local_records.push_back({start_system, open_dur, read_dur, total_dur,
-                               max_chunk_dur, chunks_count, true, "OK"});
-
-      int current_total = ++total_iterations;
-      if (current_total % 100 == 0) {
-        auto elapsed_secs = std::chrono::duration_cast<std::chrono::seconds>(
-                                now - test_start)
-                                .count();
-        std::cout << "Completed " << current_total
-                  << " iterations across all workers in " << elapsed_secs
+      int iters = ++total_iterations;
+      if (iters % 1000 == 0) {
+        auto elapsed_sec =
+            std::chrono::duration_cast<std::chrono::seconds>(end_read - test_start)
+                .count();
+        std::cout << "Completed " << iters << " iterations in " << elapsed_sec
                   << " seconds.\n";
       }
     }
@@ -311,15 +375,20 @@ int main(int argc, char* argv[]) {
   std::vector<std::thread> workers;
   workers.reserve(concurrency);
   for (int i = 0; i < concurrency; ++i) {
-    workers.emplace_back(worker_func);
+    workers.emplace_back(worker_func, i);
   }
 
   for (auto& w : workers) {
     w.join();
   }
 
-  std::cout << "\nTest completed after " << duration_minutes << " minutes.\n";
-  PrintStats(all_records);
+  auto test_end = std::chrono::steady_clock::now();
+  auto elapsed_minutes =
+      std::chrono::duration_cast<std::chrono::minutes>(test_end - test_start)
+          .count();
+  std::cout << "\nTest completed after " << elapsed_minutes << " minutes.\n";
+
+  PrintStats(all_records, target_sizes);
   WriteCsv(csv_filename, all_records);
 
   return 0;
