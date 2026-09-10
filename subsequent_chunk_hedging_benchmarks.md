@@ -224,3 +224,100 @@ Each 50 MiB request reads fifty 1 MiB chunks. This metric isolates the single wo
 3. **Negligible Overhead:**
    - Median (p50) read and total latencies remained virtually identical across all sizes (+0.08 ms on 2MB, +0.13 ms on 3MB, +0.22 ms on 5MB).
 
+---
+
+# Part III: Hedged (30-Thread Pool) vs Unhedged Comparison
+
+**Date:** September 10, 2026  
+**Environment:** Compute Engine VM `artemis` (`us-central1-a`)  
+**Target Bucket & Object:** `gs://ajayky-minerva/files/primitive_benchmark_500MB.parquet` (500 MiB Regional Bucket, `us-central1`)  
+**Configuration Changes:**
+- **Hedging Thread Pool:** Scaled from default 15 to **30 threads** (`HedgingThreadPoolSizeOption = 30`).
+- **Max Concurrent Hedges:** Increased to **30** (`MaxConcurrentHedgesOption = 30`).
+- **Connection Pool:** Scaled to **60 connections** (`ConnectionPoolSizeOption = 60`).
+- **Concurrency:** 15 worker threads in parallel.
+- **Sizes:** 2 MiB, 3 MiB, 5 MiB at random offsets.
+- **Duration:** 5 minutes Unhedged followed by 5 minutes Hedged.
+- **Total Requests:** **187,095 total requests** (96,949 Unhedged, 90,146 Hedged), **609.0 GB transferred**, **100% success rate (0 errors)**.
+
+---
+
+## 1. Overall Aggregate (All Sizes: 2 MiB, 3 MiB, 5 MiB)
+
+| Metric | Unhedged (No Hedging) | Hedged (30-Thread Pool) | Delta (Hedged vs Unhedged) |
+| :--- | :---: | :---: | :---: |
+| **Total Completed Requests** | 96,949 | 90,146 | -6,803 (-7.02%) |
+| **Throughput (QPS)** | 323.2 req/s | 300.5 req/s | -22.7 req/s (-7.02%) |
+| **Data Transferred** | 315.58 GB | 293.41 GB | -22.17 GB |
+| **Success Rate** | 100% (0 errors) | 100% (0 errors) | 0 errors |
+
+### A. Open Latency (TTFB / Connection + Initial Read)
+| Metric / Percentile | Unhedged | Hedged (30-Thread Pool) | Delta |
+| :--- | :---: | :---: | :---: |
+| **Mean** | 33.81 ms | 36.37 ms | +2.56 ms (+7.57%) |
+| **p50** | 30.76 ms | 32.45 ms | +1.68 ms (+5.46%) |
+| **p90** | 44.94 ms | 50.25 ms | +5.32 ms (+11.83%) |
+| **p95** | 53.87 ms | 62.42 ms | +8.55 ms (+15.87%) |
+| **p99** | 88.87 ms | 104.51 ms | +15.64 ms (+17.60%) |
+| **p99.9** | 231.48 ms | 232.26 ms | +0.79 ms (+0.34%) |
+| **Max** | **1,095.75 ms** | **579.03 ms** | **-516.72 ms (-47.16%)** |
+
+### B. Individual Read Latency (Payload Read Duration)
+| Metric / Percentile | Unhedged | Hedged (30-Thread Pool) | Delta |
+| :--- | :---: | :---: | :---: |
+| **Mean** | 12.57 ms | 13.49 ms | +0.92 ms (+7.28%) |
+| **p50** | 10.07 ms | 10.61 ms | +0.53 ms (+5.29%) |
+| **p90** | 21.38 ms | 23.17 ms | +1.79 ms (+8.39%) |
+| **p95** | 26.60 ms | 29.92 ms | +3.31 ms (+12.45%) |
+| **p99** | 44.75 ms | 55.46 ms | +10.71 ms (+23.94%) |
+| **p99.9** | 107.54 ms | 119.27 ms | +11.72 ms (+10.90%) |
+| **Max** | **839.80 ms** | **542.12 ms** | **-297.68 ms (-35.45%)** |
+
+### C. Total Latency (Open + Read)
+| Metric / Percentile | Unhedged | Hedged (30-Thread Pool) | Delta |
+| :--- | :---: | :---: | :---: |
+| **Mean** | 46.39 ms | 49.86 ms | +3.48 ms (+7.49%) |
+| **p50** | 42.14 ms | 44.42 ms | +2.29 ms (+5.43%) |
+| **p90** | 62.59 ms | 70.08 ms | +7.49 ms (+11.96%) |
+| **p95** | 74.63 ms | 86.38 ms | +11.75 ms (+15.75%) |
+| **p99** | 121.95 ms | 143.32 ms | +21.37 ms (+17.53%) |
+| **p99.9** | 302.75 ms | 297.49 ms | -5.26 ms (-1.74%) |
+| **Max** | **1,368.20 ms** | **861.65 ms** | **-506.55 ms (-37.02%)** |
+
+---
+
+## 2. Size Breakdown (30-Thread Hedging Pool)
+
+### 2 MiB Chunks (2,097,152 bytes)
+- Requests: Unhedged = 32,221 | Hedged = 29,886
+- **Max Open Latency:** 954.38 ms &rarr; **534.92 ms (-43.95%)**
+- **Max Read Latency:** 462.79 ms &rarr; **314.12 ms (-32.13%)**
+- **Max Total Latency:** 967.26 ms &rarr; **546.34 ms (-43.52%)**
+
+### 3 MiB Chunks (3,145,728 bytes)
+- Requests: Unhedged = 32,309 | Hedged = 30,400
+- **Max Open Latency:** 1,095.75 ms &rarr; **579.03 ms (-47.16%)**
+- **Max Read Latency:** 642.84 ms &rarr; **542.12 ms (-15.67%)**
+- **Max Total Latency:** 1,368.20 ms &rarr; **593.75 ms (-56.60%)**
+
+### 5 MiB Chunks (5,242,880 bytes)
+- Requests: Unhedged = 32,419 | Hedged = 29,860
+- **Max Open Latency:** 794.01 ms &rarr; **548.39 ms (-30.93%)**
+- **Max Read Latency:** 839.80 ms &rarr; **362.63 ms (-56.82%)**
+- **Max Total Latency:** 921.31 ms &rarr; **861.65 ms (-6.48%)**
+
+---
+
+## 3. Impact of Increasing Hedging Pool Size (15 &rarr; 30 Threads)
+
+1. **Higher Hedged Throughput (+13.6%):**
+   - With pool size 15, Hedged completed **79,376 requests**.
+   - With pool size 30, Hedged completed **90,146 requests** (+10,770 requests completed).
+2. **Eliminated Concurrency Contention:**
+   - When multiple workers encounter simultaneous stalls, the 30-thread pool provides double the concurrency capacity, eliminating waiting on hedge thread pool slot releases.
+3. **Strict Tail Clamping Across All Sizes:**
+   - 5MB read latency max dropped to **362.63 ms** (vs 590.41 ms with pool=15 and 839.80 ms unhedged).
+   - 2MB read latency max dropped to **314.12 ms** (vs 462.79 ms unhedged).
+   - 3MB total latency max dropped to **593.75 ms** (vs 1,368.20 ms unhedged).
+
+
