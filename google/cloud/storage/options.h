@@ -149,6 +149,25 @@ struct HedgingThreadPoolSizeOption {
 };
 
 /**
+ * Metrics tracking the number of open and read hedges dispatched and won.
+ */
+struct HedgeMetrics {
+  std::atomic<std::int64_t> open_hedges_dispatched{0};
+  std::atomic<std::int64_t> read_hedges_dispatched{0};
+  std::atomic<std::int64_t> open_hedges_won{0};
+  std::atomic<std::int64_t> read_hedges_won{0};
+};
+
+/**
+ * Shared metrics collector for read hedging statistics.
+ *
+ * @ingroup storage-options
+ */
+struct HedgeMetricsOption {
+  using Type = std::shared_ptr<HedgeMetrics>;
+};
+
+/**
  * Set the HTTP version used by the client.
  *
  * If this option is not provided, or is set to `default` then the library uses
@@ -535,6 +554,7 @@ using ClientOptionList = ::google::cloud::OptionList<
     storage_experimental::MaxReadHedgesOption,
     storage_experimental::ReadThreadPoolSizeOption,
     storage_experimental::HedgingThreadPoolSizeOption,
+    storage_experimental::HedgeMetricsOption,
     storage_experimental::OTelSpanEnrichmentOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

@@ -472,6 +472,10 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
       current->get<storage_experimental::MaxReadHedgesOption>();
   auto const max_buffer =
       current->get<storage_experimental::MaximumHedgeBufferOption>();
+  auto const metrics =
+      current->has<storage_experimental::HedgeMetricsOption>()
+          ? current->get<storage_experimental::HedgeMetricsOption>()
+          : nullptr;
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_ || !read_pool_) {
     return child_factory(position.offset, position.generation);
@@ -482,7 +486,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   return std::unique_ptr<ObjectReadSource>(
       std::make_unique<HedgedObjectReadSource>(
           read_pool_, hedge_pool_, std::move(child_factory), open_delay,
-          read_delay, max_hedges, max_buffer, position));
+          read_delay, max_hedges, max_buffer, position, metrics));
 }
 
 StatusOr<ListObjectsResponse> StorageConnectionImpl::ListObjects(

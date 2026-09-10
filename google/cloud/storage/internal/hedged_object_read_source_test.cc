@@ -1020,6 +1020,51 @@ TEST(HedgedObjectReadSourceTest, SeparateOpenAndReadDelays) {
   primary_closed->get_future().get();
 }
 
+TEST(HedgedObjectReadSourceTest, HedgeMetricsTracking) {
+  auto metrics =
+      std::make_shared<google::cloud::storage_experimental::HedgeMetrics>();
+
+  auto unblock_open = std::make_shared<std::promise<void>>();
+  auto open_closed = std::make_shared<std::promise<void>>();
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory = [unblock_open, open_closed,
+                  factory_calls](std::int64_t /*offset*/,
+                                 std::optional<std::int64_t> /*generation*/)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    int const call = ++*factory_calls;
+    if (call == 1) {
+      EXPECT_CALL(*mock, Read).WillOnce(BlockedRead(unblock_open, "open-slow"));
+      EXPECT_CALL(*mock, Close).WillOnce(NotifyClose(open_closed));
+    } else {
+      EXPECT_CALL(*mock, Read).WillOnce(ImmediateRead("open-fast"));
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(
+      MakeUnlimitedReadPool(), MakeUnlimitedHedgePool(), factory,
+      /*open_delay=*/std::chrono::milliseconds(1),
+      /*read_delay=*/std::chrono::milliseconds(1),
+      /*max_hedges=*/1, kUnlimitedBuffer, HedgedObjectReadSource::Position{},
+      metrics);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> result = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(result, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), result->bytes_received),
+              Eq("open-fast"));
+
+  unblock_open->set_value();
+  open_closed->get_future().get();
+
+  EXPECT_THAT(metrics->open_hedges_dispatched.load(), Eq(1));
+  EXPECT_THAT(metrics->open_hedges_won.load(), Eq(1));
+  EXPECT_THAT(metrics->read_hedges_dispatched.load(), Eq(0));
+  EXPECT_THAT(metrics->read_hedges_won.load(), Eq(0));
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

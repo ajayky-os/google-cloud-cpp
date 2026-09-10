@@ -112,17 +112,98 @@ void PrintGroupStats(std::string const& title,
   PrintPercentiles("Open Latency (TTFB)", open_latencies);
   PrintPercentiles("Read Latency (Payload)", read_latencies);
   PrintPercentiles("Max Chunk Latency", max_chunk_latencies);
+
+  std::size_t read_gt_1s = 0;
+  std::size_t read_gt_2s = 0;
+  std::size_t total_gt_1s = 0;
+  std::size_t total_gt_2s = 0;
+  std::size_t chunk_gt_1s = 0;
+  std::size_t chunk_gt_2s = 0;
+  std::size_t open_gt_1s = 0;
+  std::size_t open_gt_2s = 0;
+
+  for (auto const& r : records) {
+    if (r.success) {
+      if (r.read_duration > std::chrono::seconds(1)) ++read_gt_1s;
+      if (r.read_duration > std::chrono::seconds(2)) ++read_gt_2s;
+      if (r.total_duration > std::chrono::seconds(1)) ++total_gt_1s;
+      if (r.total_duration > std::chrono::seconds(2)) ++total_gt_2s;
+      if (r.max_chunk_duration > std::chrono::seconds(1)) ++chunk_gt_1s;
+      if (r.max_chunk_duration > std::chrono::seconds(2)) ++chunk_gt_2s;
+      if (r.open_duration > std::chrono::seconds(1)) ++open_gt_1s;
+      if (r.open_duration > std::chrono::seconds(2)) ++open_gt_2s;
+    }
+  }
+
+  auto pct = [success_count](std::size_t n) -> double {
+    return success_count > 0 ? (n * 100.0 / success_count) : 0.0;
+  };
+  std::cout << "--- Threshold Outliers ---\n";
+  std::cout << "  Payload Reads > 1s:        " << read_gt_1s << " (" << std::fixed
+            << std::setprecision(3) << pct(read_gt_1s) << "%)\n";
+  std::cout << "  Payload Reads > 2s:        " << read_gt_2s << " (" << std::fixed
+            << std::setprecision(3) << pct(read_gt_2s) << "%)\n";
+  std::cout << "  Total Requests > 1s:       " << total_gt_1s << " ("
+            << std::fixed << std::setprecision(3) << pct(total_gt_1s) << "%)\n";
+  std::cout << "  Total Requests > 2s:       " << total_gt_2s << " ("
+            << std::fixed << std::setprecision(3) << pct(total_gt_2s) << "%)\n";
+  std::cout << "  Slowest Chunk Read > 1s:   " << chunk_gt_1s << " ("
+            << std::fixed << std::setprecision(3) << pct(chunk_gt_1s) << "%)\n";
+  std::cout << "  Slowest Chunk Read > 2s:   " << chunk_gt_2s << " ("
+            << std::fixed << std::setprecision(3) << pct(chunk_gt_2s) << "%)\n";
+  std::cout << "  Stream Open (TTFB) > 1s:   " << open_gt_1s << " ("
+            << std::fixed << std::setprecision(3) << pct(open_gt_1s) << "%)\n";
+  std::cout << "  Stream Open (TTFB) > 2s:   " << open_gt_2s << " ("
+            << std::fixed << std::setprecision(3) << pct(open_gt_2s) << "%)\n";
   std::cout << "===================================================\n";
 }
 
-void PrintStats(std::vector<LatencyRecord> const& records,
-                std::vector<std::int64_t> const& target_sizes) {
+void PrintStats(
+    std::vector<LatencyRecord> const& records,
+    std::vector<std::int64_t> const& target_sizes,
+    std::shared_ptr<google::cloud::storage_experimental::HedgeMetrics> const&
+        hedge_metrics) {
   if (records.empty()) {
     std::cout << "No records.\n";
     return;
   }
 
   PrintGroupStats("Overall Summary", records);
+
+  if (hedge_metrics != nullptr) {
+    auto const open_disp = hedge_metrics->open_hedges_dispatched.load();
+    auto const open_won = hedge_metrics->open_hedges_won.load();
+    auto const read_disp = hedge_metrics->read_hedges_dispatched.load();
+    auto const read_won = hedge_metrics->read_hedges_won.load();
+    auto const tot_disp = open_disp + read_disp;
+    auto const tot_won = open_won + read_won;
+
+    std::cout << "\n================ Hedge Statistics ================\n";
+    std::cout << "Open Hedges Dispatched:  " << open_disp << "\n";
+    std::cout << "Open Hedges Won:         " << open_won;
+    if (open_disp > 0) {
+      std::cout << " (" << std::fixed << std::setprecision(2)
+                << (open_won * 100.0 / open_disp) << "% win rate)";
+    }
+    std::cout << "\n";
+
+    std::cout << "Read Hedges Dispatched:  " << read_disp << "\n";
+    std::cout << "Read Hedges Won:         " << read_won;
+    if (read_disp > 0) {
+      std::cout << " (" << std::fixed << std::setprecision(2)
+                << (read_won * 100.0 / read_disp) << "% win rate)";
+    }
+    std::cout << "\n";
+
+    std::cout << "Total Hedges Dispatched: " << tot_disp << "\n";
+    std::cout << "Total Hedges Won:        " << tot_won;
+    if (tot_disp > 0) {
+      std::cout << " (" << std::fixed << std::setprecision(2)
+                << (tot_won * 100.0 / tot_disp) << "% win rate)";
+    }
+    std::cout << "\n";
+    std::cout << "==================================================\n";
+  }
 
   if (target_sizes.size() > 1) {
     for (std::int64_t size : target_sizes) {
@@ -219,6 +300,9 @@ int main(int argc, char* argv[]) {
 
   std::vector<std::int64_t> target_sizes = ParseSizes(sizes_arg);
 
+  auto hedge_metrics =
+      std::make_shared<google::cloud::storage_experimental::HedgeMetrics>();
+
   auto options =
       google::cloud::Options{}
           .set<google::cloud::storage_experimental::EnableReadHedgingOption>(
@@ -241,6 +325,11 @@ int main(int argc, char* argv[]) {
                   .clone())
           .set<gcs::ConnectionPoolSizeOption>(
               (std::max)(concurrency * 2, hedge_pool_size * 2));
+
+  if (enable_hedging) {
+    options.set<google::cloud::storage_experimental::HedgeMetricsOption>(
+        hedge_metrics);
+  }
 
   if (stall_timeout_secs > 0) {
     options.set<gcs::DownloadStallTimeoutOption>(
@@ -474,7 +563,15 @@ int main(int argc, char* argv[]) {
             std::chrono::duration_cast<std::chrono::seconds>(end_read - test_start)
                 .count();
         std::cout << "Completed " << iters << " iterations in " << elapsed_sec
-                  << " seconds.\n";
+                  << " seconds.";
+        if (enable_hedging && hedge_metrics) {
+          std::cout << " [Hedges Won: Open="
+                    << hedge_metrics->open_hedges_won.load() << "/"
+                    << hedge_metrics->open_hedges_dispatched.load()
+                    << ", Read=" << hedge_metrics->read_hedges_won.load() << "/"
+                    << hedge_metrics->read_hedges_dispatched.load() << "]";
+        }
+        std::cout << "\n";
       }
     }
 
@@ -499,7 +596,8 @@ int main(int argc, char* argv[]) {
           .count();
   std::cout << "\nTest completed after " << elapsed_minutes << " minutes.\n";
 
-  PrintStats(all_records, target_sizes);
+  PrintStats(all_records, target_sizes,
+             enable_hedging ? hedge_metrics : nullptr);
   WriteCsv(csv_filename, all_records);
 
   return 0;

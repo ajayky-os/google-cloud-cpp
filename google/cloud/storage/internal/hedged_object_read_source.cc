@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "google/cloud/storage/internal/hedged_object_read_source.h"
+#include "google/cloud/storage/options.h"
 #include "google/cloud/storage/retry_policy.h"
 #include "google/cloud/internal/make_status.h"
 #include <atomic>
@@ -34,6 +35,7 @@ struct RaceResult {
   std::unique_ptr<ObjectReadSource> source;
   std::unique_ptr<char[]> buffer;
   std::size_t buffer_capacity = 0;
+  bool winner_is_hedge = false;
 };
 
 // Shared between the caller, which schedules the attempts and waits for the
@@ -75,7 +77,7 @@ struct RaceState {
   void RetireAttempt() {
     if (active_attempts.fetch_sub(1) != 1) return;
     if (!TryClaim()) return;
-    promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+    promise.set_value(RaceResult{FinalError(), nullptr, nullptr, 0, false});
   }
 
   void Fail(Status status, bool is_primary) {
@@ -93,7 +95,7 @@ struct RaceState {
     // access is denied, ...). Report it now instead of holding the caller
     // until every in-flight hedge has exhausted its own retry budget.
     if (permanent && TryClaim()) {
-      promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+      promise.set_value(RaceResult{FinalError(), nullptr, nullptr, 0, false});
     }
     RetireAttempt();
   }
@@ -152,7 +154,8 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
     return;
   }
   state->promise.set_value(RaceResult{std::move(result), std::move(child),
-                                      std::move(buffer), buffer_capacity});
+                                      std::move(buffer), buffer_capacity,
+                                      /*winner_is_hedge=*/!is_primary});
 }
 
 }  // namespace
@@ -161,7 +164,8 @@ HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
     std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
     std::chrono::milliseconds open_delay, std::chrono::milliseconds read_delay,
-    int max_hedges, std::size_t max_buffer, Position position)
+    int max_hedges, std::size_t max_buffer, Position position,
+    std::shared_ptr<google::cloud::storage_experimental::HedgeMetrics> metrics)
     : read_pool_(std::move(read_pool)),
       hedge_pool_(std::move(hedge_pool)),
       child_factory_(
@@ -170,10 +174,20 @@ HedgedObjectReadSource::HedgedObjectReadSource(
       read_delay_(read_delay),
       max_hedges_(max_hedges),
       max_buffer_(max_buffer),
+      metrics_(std::move(metrics)),
       current_offset_(position.offset),
       offset_direction_(position.direction),
       end_offset_(position.end_offset),
       generation_(position.generation) {}
+
+HedgedObjectReadSource::HedgedObjectReadSource(
+    std::shared_ptr<ThreadPool> read_pool,
+    std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
+    std::chrono::milliseconds open_delay, std::chrono::milliseconds read_delay,
+    int max_hedges, std::size_t max_buffer, Position position)
+    : HedgedObjectReadSource(std::move(read_pool), std::move(hedge_pool),
+                             std::move(child_factory), open_delay, read_delay,
+                             max_hedges, max_buffer, position, nullptr) {}
 
 HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
@@ -262,6 +276,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadDirect(char* buf,
 
 StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(
     char* buf, std::size_t n, std::chrono::milliseconds delay) {
+  auto const is_open = !active_child_;
   auto state = std::make_shared<RaceState>();
   auto future = state->promise.get_future();
   state->active_attempts.store(1);
@@ -300,6 +315,15 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(
       continue;
     }
     state->active_attempts.fetch_add(1);
+    if (metrics_) {
+      if (is_open) {
+        metrics_->open_hedges_dispatched.fetch_add(1,
+                                                   std::memory_order_relaxed);
+      } else {
+        metrics_->read_hedges_dispatched.fetch_add(1,
+                                                   std::memory_order_relaxed);
+      }
+    }
     auto hedge = [state, factory = child_factory_, offset = current_offset_,
                   gen = generation_, n, pool = hedge_pool_] {
       RunAttempt(state, *factory, /*child=*/nullptr, /*buffer=*/nullptr,
@@ -309,12 +333,28 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(
     if (!hedge_pool_->Enqueue(hedge)) {
       hedge_pool_->ReleaseHedgeSlot();
       state->RetireAttempt();
+      if (metrics_) {
+        if (is_open) {
+          metrics_->open_hedges_dispatched.fetch_sub(1,
+                                                     std::memory_order_relaxed);
+        } else {
+          metrics_->read_hedges_dispatched.fetch_sub(1,
+                                                     std::memory_order_relaxed);
+        }
+      }
       break;
     }
     ++hedges_dispatched;
   }
 
   RaceResult race = future.get();
+  if (metrics_ && race.winner_is_hedge) {
+    if (is_open) {
+      metrics_->open_hedges_won.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      metrics_->read_hedges_won.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   active_child_ = std::move(race.source);
   if (!race.result) {
     // Every attempt failed and closed its own child, there is nothing left to

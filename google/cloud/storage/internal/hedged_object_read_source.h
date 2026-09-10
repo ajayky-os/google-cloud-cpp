@@ -18,6 +18,7 @@
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/object_read_source.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
+#include "google/cloud/storage/options.h"
 #include "google/cloud/storage/version.h"
 #include <chrono>
 #include <cstdint>
@@ -80,6 +81,16 @@ class HedgedObjectReadSource : public ObjectReadSource {
     std::optional<std::int64_t> generation;
   };
 
+  HedgedObjectReadSource(
+      std::shared_ptr<ThreadPool> read_pool,
+      std::shared_ptr<HedgingThreadPool> hedge_pool,
+      ChildFactory child_factory,
+      std::chrono::milliseconds open_delay,
+      std::chrono::milliseconds read_delay, int max_hedges,
+      std::size_t max_buffer, Position position,
+      std::shared_ptr<google::cloud::storage_experimental::HedgeMetrics>
+          metrics);
+
   HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
                          std::shared_ptr<HedgingThreadPool> hedge_pool,
                          ChildFactory child_factory,
@@ -122,6 +133,7 @@ class HedgedObjectReadSource : public ObjectReadSource {
   std::chrono::milliseconds read_delay_;
   int max_hedges_;
   std::size_t max_buffer_;
+  std::shared_ptr<google::cloud::storage_experimental::HedgeMetrics> metrics_;
 
   std::int64_t current_offset_;
   OffsetDirection offset_direction_;
