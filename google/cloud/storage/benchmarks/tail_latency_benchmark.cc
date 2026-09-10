@@ -214,6 +214,8 @@ int main(int argc, char* argv[]) {
       (argc >= 11) ? std::stoull(argv[10]) : (1024 * 1024ULL);
   int hedge_pool_size = (argc >= 12) ? std::stoi(argv[11]) : 30;
   bool verify_checksum = (argc >= 13) ? (std::stoi(argv[12]) != 0) : true;
+  int open_hedge_delay_ms =
+      (argc >= 14) ? std::stoi(argv[13]) : hedge_delay_ms;
 
   std::vector<std::int64_t> target_sizes = ParseSizes(sizes_arg);
 
@@ -223,6 +225,8 @@ int main(int argc, char* argv[]) {
               enable_hedging)
           .set<google::cloud::storage_experimental::ReadHedgeDelayOption>(
               std::chrono::milliseconds(hedge_delay_ms))
+          .set<google::cloud::storage_experimental::OpenHedgeDelayOption>(
+              std::chrono::milliseconds(open_hedge_delay_ms))
           .set<google::cloud::storage_experimental::MaxConcurrentHedgesOption>(
               hedge_pool_size)
           .set<google::cloud::storage_experimental::HedgingThreadPoolSizeOption>(
@@ -313,8 +317,9 @@ int main(int argc, char* argv[]) {
   std::cout << "Chunk Size:      " << chunk_size_bytes << " bytes\n";
   std::cout << "Hedging Enabled: " << (enable_hedging ? "Yes" : "No") << "\n";
   if (enable_hedging) {
-    std::cout << "Hedge Delay:     " << hedge_delay_ms << " ms\n";
-    std::cout << "Hedge Pool Size: " << hedge_pool_size << " threads\n";
+    std::cout << "Read Hedge Delay: " << hedge_delay_ms << " ms\n";
+    std::cout << "Open Hedge Delay: " << open_hedge_delay_ms << " ms\n";
+    std::cout << "Hedge Pool Size:  " << hedge_pool_size << " threads\n";
   }
   if (stall_timeout_secs > 0) {
     std::cout << "Stall Timeout:   " << stall_timeout_secs << " sec\n";

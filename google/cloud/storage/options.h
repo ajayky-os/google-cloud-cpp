@@ -100,6 +100,17 @@ struct ReadHedgeDelayOption {
 };
 
 /**
+ * The delay before starting a hedged request for stream open (initial peek/read).
+ *
+ * If not specified, defaults to `ReadHedgeDelayOption`.
+ *
+ * @ingroup storage-options
+ */
+struct OpenHedgeDelayOption {
+  using Type = std::chrono::milliseconds;
+};
+
+/**
  * The maximum number of hedged requests per stream open.
  *
  * The default is 2. Set to 0 to disable hedging for reads even when
@@ -520,6 +531,7 @@ using ClientOptionList = ::google::cloud::OptionList<
     storage_experimental::MaxConcurrentHedgesOption,
     storage_experimental::MaximumHedgeBufferOption,
     storage_experimental::ReadHedgeDelayOption,
+    storage_experimental::OpenHedgeDelayOption,
     storage_experimental::MaxReadHedgesOption,
     storage_experimental::ReadThreadPoolSizeOption,
     storage_experimental::HedgingThreadPoolSizeOption,

@@ -597,6 +597,10 @@ Options DefaultOptions(Options opts) {
     o.set<storage_experimental::ReadHedgeDelayOption>(
         std::chrono::milliseconds(500));
   }
+  if (!o.has<storage_experimental::OpenHedgeDelayOption>()) {
+    o.set<storage_experimental::OpenHedgeDelayOption>(
+        o.get<storage_experimental::ReadHedgeDelayOption>());
+  }
   if (!o.has<storage_experimental::MaxReadHedgesOption>()) {
     o.set<storage_experimental::MaxReadHedgesOption>(2);
   }

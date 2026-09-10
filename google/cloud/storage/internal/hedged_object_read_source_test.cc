@@ -982,6 +982,44 @@ TEST(HedgedObjectReadSourceTest, NoRaceAtReadLastEnd) {
   ExpectNoRaceAtEnd(position, MakeReadResult("12345"));
 }
 
+TEST(HedgedObjectReadSourceTest, SeparateOpenAndReadDelays) {
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+  auto primary_closed = std::make_shared<std::promise<void>>();
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory = [unblock_primary, primary_closed,
+                  factory_calls](std::int64_t /*offset*/,
+                                 std::optional<std::int64_t> /*generation*/)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (++*factory_calls == 1) {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(BlockedRead(unblock_primary, "open-primary"));
+      EXPECT_CALL(*mock, Close).WillOnce(NotifyClose(primary_closed));
+    } else {
+      EXPECT_CALL(*mock, Read).WillOnce(ImmediateRead("open-hedge"));
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  // Set open_delay to 1ms so hedge triggers quickly on open, but read_delay to 10s.
+  HedgedObjectReadSource source(
+      MakeUnlimitedReadPool(), MakeUnlimitedHedgePool(), factory,
+      /*open_delay=*/std::chrono::milliseconds(1),
+      /*read_delay=*/std::chrono::seconds(10),
+      /*max_hedges=*/1, kUnlimitedBuffer, HedgedObjectReadSource::Position{});
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> result = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(result, IsOk());
+  EXPECT_THAT(result->bytes_received, Eq(10));
+  EXPECT_THAT(std::string(buffer.data(), result->bytes_received),
+              Eq("open-hedge"));
+
+  unblock_primary->set_value();
+  primary_closed->get_future().get();
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END

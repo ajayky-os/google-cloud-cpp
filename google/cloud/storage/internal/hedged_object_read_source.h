@@ -83,6 +83,13 @@ class HedgedObjectReadSource : public ObjectReadSource {
   HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
                          std::shared_ptr<HedgingThreadPool> hedge_pool,
                          ChildFactory child_factory,
+                         std::chrono::milliseconds open_delay,
+                         std::chrono::milliseconds read_delay, int max_hedges,
+                         std::size_t max_buffer, Position position);
+
+  HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
+                         std::shared_ptr<HedgingThreadPool> hedge_pool,
+                         ChildFactory child_factory,
                          std::chrono::milliseconds delay, int max_hedges,
                          std::size_t max_buffer, Position position);
 
@@ -103,14 +110,16 @@ class HedgedObjectReadSource : public ObjectReadSource {
   bool ShouldRace(std::size_t n) const;
   bool AtEnd() const;
   StatusOr<ReadSourceResult> ReadDirect(char* buf, std::size_t n);
-  StatusOr<ReadSourceResult> ReadRaced(char* buf, std::size_t n);
+  StatusOr<ReadSourceResult> ReadRaced(char* buf, std::size_t n,
+                                       std::chrono::milliseconds delay);
   void UpdateState(StatusOr<ReadSourceResult> const& result);
 
   std::shared_ptr<ThreadPool> read_pool_;
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
   // Shared with the racing attempts, which may outlive this object.
   std::shared_ptr<ChildFactory const> child_factory_;
-  std::chrono::milliseconds delay_;
+  std::chrono::milliseconds open_delay_;
+  std::chrono::milliseconds read_delay_;
   int max_hedges_;
   std::size_t max_buffer_;
 

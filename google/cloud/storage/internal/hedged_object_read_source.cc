@@ -160,13 +160,14 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
 HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
     std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
-    std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer,
-    Position position)
+    std::chrono::milliseconds open_delay, std::chrono::milliseconds read_delay,
+    int max_hedges, std::size_t max_buffer, Position position)
     : read_pool_(std::move(read_pool)),
       hedge_pool_(std::move(hedge_pool)),
       child_factory_(
           std::make_shared<ChildFactory const>(std::move(child_factory))),
-      delay_(delay),
+      open_delay_(open_delay),
+      read_delay_(read_delay),
       max_hedges_(max_hedges),
       max_buffer_(max_buffer),
       current_offset_(position.offset),
@@ -177,9 +178,18 @@ HedgedObjectReadSource::HedgedObjectReadSource(
 HedgedObjectReadSource::HedgedObjectReadSource(
     std::shared_ptr<ThreadPool> read_pool,
     std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
+    std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer,
+    Position position)
+    : HedgedObjectReadSource(std::move(read_pool), std::move(hedge_pool),
+                             std::move(child_factory), delay, delay, max_hedges,
+                             max_buffer, position) {}
+
+HedgedObjectReadSource::HedgedObjectReadSource(
+    std::shared_ptr<ThreadPool> read_pool,
+    std::shared_ptr<HedgingThreadPool> hedge_pool, ChildFactory child_factory,
     std::chrono::milliseconds delay, int max_hedges, std::size_t max_buffer)
     : HedgedObjectReadSource(std::move(read_pool), std::move(hedge_pool),
-                             std::move(child_factory), delay, max_hedges,
+                             std::move(child_factory), delay, delay, max_hedges,
                              max_buffer, Position{}) {}
 
 bool HedgedObjectReadSource::IsOpen() const {
@@ -200,9 +210,11 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::Read(char* buf,
   if (is_closed_) {
     return ReadSourceResult{0, HttpResponse{HttpStatusCode::kOk, {}, {}}};
   }
+  auto const is_open = !active_child_;
+  auto const delay = is_open ? open_delay_ : read_delay_;
   auto const start = std::chrono::steady_clock::now();
-  auto result = ShouldRace(n) ? ReadRaced(buf, n) : ReadDirect(buf, n);
-  last_read_stalled_ = std::chrono::steady_clock::now() - start > delay_;
+  auto result = ShouldRace(n) ? ReadRaced(buf, n, delay) : ReadDirect(buf, n);
+  last_read_stalled_ = std::chrono::steady_clock::now() - start > read_delay_;
   UpdateState(result);
   return result;
 }
@@ -248,8 +260,8 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadDirect(char* buf,
   return active_child_->Read(buf, n);
 }
 
-StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
-                                                             std::size_t n) {
+StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(
+    char* buf, std::size_t n, std::chrono::milliseconds delay) {
   auto state = std::make_shared<RaceState>();
   auto future = state->promise.get_future();
   state->active_attempts.store(1);
@@ -274,12 +286,12 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
   if (!read_pool_->Enqueue(primary)) primary();
 
   for (int hedges_dispatched = 0; hedges_dispatched < max_hedges_;) {
-    if (future.wait_for(delay_) != std::future_status::timeout) break;
+    if (future.wait_for(delay) != std::future_status::timeout) break;
     if (!hedge_pool_->TryAcquireHedgeToken()) {
-      // When delay_ is 0ms (or token acquisition fails), back off briefly on
+      // When delay is 0ms (or token acquisition fails), back off briefly on
       // the future instead of busy-spinning if tokens or concurrency slots are
       // temporarily exhausted.
-      if (delay_ == std::chrono::milliseconds::zero()) {
+      if (delay == std::chrono::milliseconds::zero()) {
         if (future.wait_for(std::chrono::milliseconds(10)) !=
             std::future_status::timeout) {
           break;
