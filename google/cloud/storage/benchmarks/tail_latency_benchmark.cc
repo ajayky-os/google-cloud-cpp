@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include "google/cloud/storage/client.h"
+#include "google/cloud/storage/hashing_options.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -39,6 +41,7 @@ struct LatencyRecord {
   std::chrono::microseconds max_chunk_duration;
   std::size_t chunks_count;
   bool success;
+  bool checksum_ok;
   std::string status_code;
 };
 
@@ -77,6 +80,7 @@ void PrintGroupStats(std::string const& title,
 
   std::size_t success_count = 0;
   std::size_t failure_count = 0;
+  std::size_t checksum_failure_count = 0;
 
   total_latencies.reserve(records.size());
   open_latencies.reserve(records.size());
@@ -86,6 +90,9 @@ void PrintGroupStats(std::string const& title,
   for (auto const& r : records) {
     if (r.success) {
       ++success_count;
+      if (!r.checksum_ok) {
+        ++checksum_failure_count;
+      }
       total_latencies.push_back(r.total_duration);
       open_latencies.push_back(r.open_duration);
       read_latencies.push_back(r.read_duration);
@@ -99,6 +106,7 @@ void PrintGroupStats(std::string const& title,
   std::cout << "Total Requests:      " << records.size() << "\n";
   std::cout << "Successful Requests: " << success_count << "\n";
   std::cout << "Failed Requests:     " << failure_count << "\n";
+  std::cout << "Checksum Failures:   " << checksum_failure_count << "\n";
 
   PrintPercentiles("Total Latency", total_latencies);
   PrintPercentiles("Open Latency (TTFB)", open_latencies);
@@ -140,7 +148,7 @@ void WriteCsv(std::string const& filename,
     return;
   }
   out << "Timestamp_ms,Size_bytes,Offset,Open_ms,Read_ms,Total_ms,MaxChunk_ms,"
-         "Chunks,Success,StatusCode\n";
+         "Chunks,Success,ChecksumOk,StatusCode\n";
   for (auto const& r : records) {
     auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      r.timestamp.time_since_epoch())
@@ -150,7 +158,8 @@ void WriteCsv(std::string const& filename,
         << (r.read_duration.count() / 1000.0) << ","
         << (r.total_duration.count() / 1000.0) << ","
         << (r.max_chunk_duration.count() / 1000.0) << "," << r.chunks_count
-        << "," << (r.success ? "1" : "0") << "," << r.status_code << "\n";
+        << "," << (r.success ? "1" : "0") << "," << (r.checksum_ok ? "1" : "0")
+        << "," << r.status_code << "\n";
   }
   std::cout << "\nRaw latencies written to " << filename << "\n";
 }
@@ -204,6 +213,7 @@ int main(int argc, char* argv[]) {
   std::size_t chunk_size_bytes =
       (argc >= 11) ? std::stoull(argv[10]) : (1024 * 1024ULL);
   int hedge_pool_size = (argc >= 12) ? std::stoi(argv[11]) : 30;
+  bool verify_checksum = (argc >= 13) ? (std::stoi(argv[12]) != 0) : true;
 
   std::vector<std::int64_t> target_sizes = ParseSizes(sizes_arg);
 
@@ -220,7 +230,7 @@ int main(int argc, char* argv[]) {
           .set<google::cloud::storage_experimental::HttpConnectTimeoutOption>(
               std::chrono::milliseconds(1000))
           .set<google::cloud::storage_experimental::MaximumHedgeBufferOption>(
-              8 * 1024 * 1024)
+              64 * 1024 * 1024)
           .set<gcs::BackoffPolicyOption>(
               gcs::ExponentialBackoffPolicy(std::chrono::milliseconds(1),
                                             std::chrono::milliseconds(2), 2.0)
@@ -245,6 +255,45 @@ int main(int argc, char* argv[]) {
   } else {
     std::cout << "Warning: Could not fetch object metadata (" << meta.status()
               << "), defaulting object size to " << object_size << " bytes.\n";
+  }
+
+  std::shared_ptr<std::vector<char>> reference_data;
+  if (verify_checksum) {
+    if (object_size > 2LL * 1024 * 1024 * 1024LL) {
+      std::cout << "Warning: Object size (" << object_size
+                << " bytes) > 2GB, skipping reference pre-load for checksums.\n";
+    } else {
+      std::cout << "Loading reference data for object ("
+                << (object_size / (1024 * 1024))
+                << " MB) for checksum verification...\n";
+      auto ref_vec = std::make_shared<std::vector<char>>(object_size);
+      auto ref_options =
+          google::cloud::Options{}
+              .set<google::cloud::storage_experimental::EnableReadHedgingOption>(
+                  false);
+      auto ref_client = gcs::Client(ref_options);
+      auto is = ref_client.ReadObject(bucket_name, object_name);
+      std::size_t total_read = 0;
+      std::vector<char> ref_buf(4 * 1024 * 1024);
+      while (is) {
+        is.read(ref_buf.data(), ref_buf.size());
+        std::streamsize bytes = is.gcount();
+        if (bytes > 0) {
+          if (total_read + bytes <= ref_vec->size()) {
+            std::memcpy(ref_vec->data() + total_read, ref_buf.data(), bytes);
+          }
+          total_read += bytes;
+        }
+      }
+      if (total_read != static_cast<std::size_t>(object_size)) {
+        std::cerr << "Reference object size mismatch: read " << total_read
+                  << " vs expected " << object_size << "\n";
+        return 1;
+      }
+      reference_data = std::move(ref_vec);
+      std::cout << "Successfully loaded reference data (" << total_read
+                << " bytes). Checksum verification active.\n";
+    }
   }
 
   std::vector<LatencyRecord> all_records;
@@ -272,11 +321,20 @@ int main(int argc, char* argv[]) {
   } else {
     std::cout << "Stall Timeout:   Disabled\n";
   }
+  std::cout << "Checksum Check:  "
+            << (reference_data != nullptr ? "Enabled (Byte-exact + CRC32C)"
+                                          : "Disabled")
+            << "\n";
 
   auto test_start = std::chrono::steady_clock::now();
   auto target_duration =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::duration<double, std::ratio<60>>(duration_minutes));
+
+  std::int64_t max_req_size = 0;
+  for (std::int64_t s : target_sizes) {
+    if (s > max_req_size) max_req_size = s;
+  }
 
   auto worker_func = [&](int thread_id) {
     std::vector<LatencyRecord> local_records;
@@ -284,6 +342,11 @@ int main(int argc, char* argv[]) {
         static_cast<std::size_t>(duration_minutes * 60 * 100));
 
     std::vector<char> buffer(chunk_size_bytes);
+    std::vector<char> req_buffer;
+    if (reference_data != nullptr) {
+      req_buffer.resize(max_req_size);
+    }
+
     std::mt19937_64 rng(std::random_device{}() + thread_id * 10007);
     std::uniform_int_distribution<std::size_t> size_dist(
         0, target_sizes.size() - 1);
@@ -318,7 +381,7 @@ int main(int argc, char* argv[]) {
         local_records.push_back(
             {start_system, req_size, req_offset, open_dur,
              std::chrono::microseconds(0), total_dur,
-             std::chrono::microseconds(0), 0, false,
+             std::chrono::microseconds(0), 0, false, false,
              google::cloud::StatusCodeToString(stream.status().code())});
         continue;
       }
@@ -326,6 +389,8 @@ int main(int argc, char* argv[]) {
       std::size_t chunks_count = 0;
       std::chrono::microseconds max_chunk_dur{0};
       bool read_failed = false;
+      bool checksum_ok = true;
+      std::size_t bytes_received_total = 0;
 
       while (true) {
         auto chunk_start = std::chrono::steady_clock::now();
@@ -340,12 +405,48 @@ int main(int argc, char* argv[]) {
           if (chunk_dur > max_chunk_dur) {
             max_chunk_dur = chunk_dur;
           }
+          if (reference_data != nullptr) {
+            if (req_offset + bytes_received_total + bytes_read <=
+                reference_data->size()) {
+              if (std::memcmp(
+                      buffer.data(),
+                      reference_data->data() + req_offset + bytes_received_total,
+                      bytes_read) != 0) {
+                checksum_ok = false;
+              }
+            } else {
+              checksum_ok = false;
+            }
+            if (bytes_received_total + bytes_read <= req_buffer.size()) {
+              std::memcpy(req_buffer.data() + bytes_received_total,
+                          buffer.data(), bytes_read);
+            }
+          }
+          bytes_received_total += bytes_read;
         }
         if (!stream) {
           if (stream.bad() && !stream.status().ok()) {
             read_failed = true;
           }
           break;
+        }
+      }
+
+      if (bytes_received_total != static_cast<std::size_t>(req_size)) {
+        if (!read_failed) checksum_ok = false;
+      }
+
+      if (reference_data != nullptr && !read_failed && checksum_ok) {
+        auto actual_crc = gcs::ComputeCrc32cChecksum(
+            absl::string_view(req_buffer.data(), bytes_received_total));
+        auto expected_crc = gcs::ComputeCrc32cChecksum(
+            absl::string_view(reference_data->data() + req_offset, req_size));
+        if (actual_crc != expected_crc) {
+          checksum_ok = false;
+          std::cerr << "CRC32C mismatch: thread=" << thread_id
+                    << " offset=" << req_offset << " size=" << req_size
+                    << " actual=" << actual_crc << " expected=" << expected_crc
+                    << "\n";
         }
       }
 
@@ -357,13 +458,13 @@ int main(int argc, char* argv[]) {
 
       local_records.push_back(
           {start_system, req_size, req_offset, open_dur, read_dur, total_dur,
-           max_chunk_dur, chunks_count, !read_failed,
+           max_chunk_dur, chunks_count, !read_failed, checksum_ok,
            read_failed
                ? google::cloud::StatusCodeToString(stream.status().code())
                : "OK"});
 
       int iters = ++total_iterations;
-      if (iters % 1000 == 0) {
+      if (iters % 500 == 0) {
         auto elapsed_sec =
             std::chrono::duration_cast<std::chrono::seconds>(end_read - test_start)
                 .count();

@@ -517,3 +517,97 @@ Each 50 MiB request reads fifty 1 MiB chunks. This metric isolates the single wo
 | **Max Chunk Latency (p95)** | 15.05 ms | **13.29 ms** | **-1.76 ms (-11.68%)** |
 | **Max Chunk Latency (p90)** | 11.14 ms | **9.81 ms** | **-1.33 ms (-11.94%)** |
 
+---
+
+## Part VI: 30-Minute 50MB Large-Payload Benchmark with Full Integrity Checksum Verification
+
+### 1. Test Setup & Correctness Methodology
+* **Workload**: 50 MB random-range reads (`ReadRange(offset, offset + 50MB)`) against `gs://ajayky-minerva/files/primitive_benchmark_500MB.parquet`.
+* **Chunk Transfer Model**: Each 50 MB read executes 50 sequential 1 MB chunk reads (`stream.read(buffer, 1MB)`) over the HTTP/JSON connection.
+* **Duration**: **30 minutes** Unhedged, followed by **30 minutes** Hedged (Reactive Fix) — total 60 minutes runtime.
+* **Concurrency**: 15 parallel workers.
+* **Hedging Configuration**: 500 ms hedge delay, 30 hedge threadpool size, 60 connection pool, 64 MB maximum hedge buffer.
+* **Integrity & Checksum Verification**:
+  1. Golden reference copy of the entire 500 MB parquet object pre-loaded into memory at benchmark startup.
+  2. In-line byte-for-byte exact validation (`std::memcmp`) performed on every individual 1 MB chunk against the reference slice.
+  3. Full 50 MB request assembly validated with `google::cloud::storage::ComputeCrc32cChecksum` compared against golden slice CRC32C.
+  4. Per-request `ChecksumOk` tracked in raw CSV outputs and aggregated in console summaries.
+
+---
+
+### 2. Overall Summary & Throughput
+
+| Metric | Unhedged Baseline | Hedged (Reactive Fix) | Delta / Improvement |
+| :--- | :---: | :---: | :---: |
+| **Duration** | 30 minutes | 30 minutes | — |
+| **Total Completed Requests** | 66,776 | **68,959** | **+2,183 (+3.27%)** |
+| **Request Throughput** | 37.10 req/s | **38.31 req/s** | **+1.21 req/s (+3.27%)** |
+| **Data Transferred** | 3,260.55 GB (3.26 TB) | **3,367.14 GB (3.37 TB)** | **+106.59 GB (+3.27%)** |
+| **Failed Requests** | **0** | **0** | 100.0% Success Rate |
+| **Checksum / CRC32C Failures** | **0 / 66,776 (0.00%)** | **0 / 68,959 (0.00%)** | **100.0% Exact Integrity (0 errors)** |
+
+---
+
+### 3. Detailed Percentile Comparisons (50 MB Payload)
+
+#### Total Request Latency
+| Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged | % Improvement |
+| :--- | :---: | :---: | :---: | :---: |
+| **Mean** | 404.32 ms | **391.54 ms** | **-12.78 ms** | **+3.16%** |
+| **p50 (Median)** | 369.27 ms | **361.47 ms** | **-7.80 ms** | **+2.11%** |
+| **p90** | 540.91 ms | **510.98 ms** | **-29.93 ms** | **+5.53%** |
+| **p95** | 654.39 ms | **609.84 ms** | **-44.55 ms** | **+6.81%** |
+| **p99** | 971.71 ms | **896.81 ms** | **-74.90 ms** | **+7.71%** |
+| **p99.9** | 1,715.19 ms | 1,763.88 ms | +48.69 ms | -2.84% |
+| **Max** | 10,771.10 ms | **6,134.78 ms** | **-4,636.32 ms** | **+43.04%** |
+
+#### Open Latency (TTFB)
+| Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged | % Improvement |
+| :--- | :---: | :---: | :---: | :---: |
+| **Mean** | 43.61 ms | **42.74 ms** | **-0.87 ms** | **+1.99%** |
+| **p50 (Median)** | 37.89 ms | **37.77 ms** | **-0.12 ms** | **+0.32%** |
+| **p90** | 60.92 ms | **59.22 ms** | **-1.71 ms** | **+2.80%** |
+| **p95** | 78.68 ms | **74.32 ms** | **-4.36 ms** | **+5.54%** |
+| **p99** | 141.77 ms | **131.42 ms** | **-10.35 ms** | **+7.30%** |
+| **p99.9** | 342.67 ms | **331.61 ms** | **-11.05 ms** | **+3.23%** |
+| **Max** | 1,704.06 ms | **628.72 ms** | **-1,075.34 ms** | **+63.10%** |
+
+#### Read Latency (50 MB Payload Stream)
+| Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged | % Improvement |
+| :--- | :---: | :---: | :---: | :---: |
+| **Mean** | 360.71 ms | **348.80 ms** | **-11.91 ms** | **+3.30%** |
+| **p50 (Median)** | 329.44 ms | **322.01 ms** | **-7.43 ms** | **+2.25%** |
+| **p90** | 484.59 ms | **457.13 ms** | **-27.46 ms** | **+5.67%** |
+| **p95** | 582.21 ms | **542.97 ms** | **-39.25 ms** | **+6.74%** |
+| **p99** | 864.34 ms | **799.34 ms** | **-65.00 ms** | **+7.52%** |
+| **p99.9** | 1,516.37 ms | 1,611.32 ms | +94.95 ms | -6.26% |
+| **Max** | 10,427.90 ms | **5,546.95 ms** | **-4,880.95 ms** | **+46.81%** |
+
+#### Max Chunk Latency (Worst-Case 1 MB Chunk within a 50 MB Request)
+| Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged | % Improvement |
+| :--- | :---: | :---: | :---: | :---: |
+| **Mean** | 41.01 ms | **40.50 ms** | **-0.51 ms** | **+1.24%** |
+| **p50 (Median)** | 34.67 ms | **34.67 ms** | **0.00 ms** | **0.00%** |
+| **p90** | 61.73 ms | **61.01 ms** | **-0.72 ms** | **+1.17%** |
+| **p95** | 77.98 ms | **76.36 ms** | **-1.62 ms** | **+2.08%** |
+| **p99** | 143.25 ms | **132.88 ms** | **-10.37 ms** | **+7.24%** |
+| **p99.9** | 536.73 ms | **495.45 ms** | **-41.27 ms** | **+7.69%** |
+| **Max** | 5,054.97 ms | **2,914.80 ms** | **-2,140.17 ms** | **+42.34%** |
+
+---
+
+### 4. Key Takeaways & Correctness Verification
+
+1. **100% Data Integrity & Zero Checksum Failures**:
+   Across **135,735 requests** of 50 MB each (representing **6.786 Terabytes** of transfer and **6,786,750 individual 1 MB chunks**), zero data discrepancies were detected. Both per-chunk `std::memcmp` against golden memory and end-of-request `ComputeCrc32cChecksum` passed with 100% accuracy in both direct reads and raced hedge reads.
+
+2. **Tail Latency Clamping on Large Payloads**:
+   - **Open Max Latency**: Dropped from **1,704.06 ms to 628.72 ms (-63.10%)**.
+   - **Read Max Latency**: Dropped from **10,427.90 ms to 5,546.95 ms (-46.81%)**, eliminating a **4.88-second tail stall**.
+   - **Total Max Latency**: Clamped from **10,771.10 ms to 6,134.78 ms (-43.04%)**, eliminating a **4.64-second stall**.
+   - **Worst-Case 1 MB Chunk**: Slashed from **5,054.97 ms to 2,914.80 ms (-42.34%)**.
+
+3. **Throughput Surplus (+3.27%)**:
+   Rather than incurring overhead from concurrency or libcurl hedging, the reactive hedging fix delivered **+2,183 more completed requests** (+106.59 GB more data) in the identical 30-minute window because worker threads were never blocked by the multi-second stalls that plagued unhedged connections.
+
+
