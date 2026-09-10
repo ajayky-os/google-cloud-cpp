@@ -17,10 +17,13 @@
 
 #include "google/cloud/storage/internal/hedging_thread_pool.h"
 #include "google/cloud/storage/internal/object_read_source.h"
+#include "google/cloud/storage/internal/retry_object_read_source.h"
 #include "google/cloud/storage/version.h"
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace google {
 namespace cloud {
@@ -29,34 +32,49 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 
 /**
- * Hedge the *open* of an `ObjectReadSource` to reduce tail latency.
+ * Hedge reads of an `ObjectReadSource` to reduce tail latency.
  *
- * The first `Read()` races one or more children created by `child_factory`:
- * a primary attempt starts immediately, and up to @p max_hedges additional
- * attempts start, staggered by @p delay, while no attempt has completed. The
- * first attempt to complete its initial read wins; losing attempts are closed
- * when they eventually complete.
+ * Each `Read()` races the active child (or a newly opened child for the first
+ * read) against one or more children created by @p child_factory at the
+ * stream's current byte offset: a primary attempt starts immediately, and up to
+ * @p max_hedges additional attempts start, staggered by @p delay, while no
+ * attempt has completed. The first attempt to complete its read wins; losing
+ * attempts are closed when they eventually complete. If a hedge wins, it
+ * replaces the active child for subsequent reads.
  *
- * Only the initial open is hedged. `ObjectReadSource` is a stream, so a hedge
- * started mid-stream would restart from the request's initial offset and
- * could return the wrong bytes. After the race, all subsequent reads simply
- * continue on the winning child at its current offset, with no extra threads
- * or copies.
+ * If decompressive transcoding is detected (`is_gunzipped_`), mid-stream range
+ * hedging is bypassed and reads continue on the active child directly.
  *
  * Each racing attempt reads into its own buffer, because a losing attempt
  * keeps writing until it completes and must not touch the caller's buffer.
- * Peak memory for the race is therefore proportional to the size of the first
- * read. Reads larger than @p max_buffer are served without hedging, directly
- * into the caller's buffer, so a large read cannot multiply memory use.
+ * Reads larger than @p max_buffer are served without hedging, directly into the
+ * caller's buffer, so a large read cannot multiply memory use.
  */
 class HedgedObjectReadSource : public ObjectReadSource {
  public:
   using ChildFactory =
+      std::function<StatusOr<std::unique_ptr<ObjectReadSource>>(
+          std::int64_t current_offset, std::optional<std::int64_t> generation)>;
+  using SimpleChildFactory =
       std::function<StatusOr<std::unique_ptr<ObjectReadSource>>()>;
 
   HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
                          std::shared_ptr<HedgingThreadPool> hedge_pool,
                          ChildFactory child_factory,
+                         std::chrono::milliseconds delay, int max_hedges,
+                         std::size_t max_buffer, std::int64_t current_offset,
+                         OffsetDirection offset_direction,
+                         std::optional<std::int64_t> generation);
+
+  HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
+                         std::shared_ptr<HedgingThreadPool> hedge_pool,
+                         ChildFactory child_factory,
+                         std::chrono::milliseconds delay, int max_hedges,
+                         std::size_t max_buffer);
+
+  HedgedObjectReadSource(std::shared_ptr<ThreadPool> read_pool,
+                         std::shared_ptr<HedgingThreadPool> hedge_pool,
+                         SimpleChildFactory child_factory,
                          std::chrono::milliseconds delay, int max_hedges,
                          std::size_t max_buffer);
 
@@ -67,12 +85,22 @@ class HedgedObjectReadSource : public ObjectReadSource {
   StatusOr<ReadSourceResult> Read(char* buf, std::size_t n) override;
 
  private:
+  void UpdateState(StatusOr<ReadSourceResult> const& result);
+
   std::shared_ptr<ThreadPool> read_pool_;
   std::shared_ptr<HedgingThreadPool> hedge_pool_;
   ChildFactory child_factory_;
   std::chrono::milliseconds delay_;
   int max_hedges_;
   std::size_t max_buffer_;
+
+  std::int64_t current_offset_;
+  OffsetDirection offset_direction_;
+  std::optional<std::int64_t> generation_;
+  bool is_gunzipped_ = false;
+
+  std::unique_ptr<char[]> primary_buffer_;
+  std::size_t primary_buffer_capacity_ = 0;
 
   std::unique_ptr<ObjectReadSource> active_child_;
   bool is_closed_ = false;

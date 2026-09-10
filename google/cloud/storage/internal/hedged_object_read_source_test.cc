@@ -526,6 +526,342 @@ TEST(HedgedObjectReadSourceTest, SubsequentReadsIgnoreBufferLimit) {
   EXPECT_THAT(calls->load(), Eq(1));
 }
 
+TEST(HedgedObjectReadSourceTest, SubsequentReadHedgeWinsWhenPrimaryStalls) {
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+  auto primary_closed = std::make_shared<std::promise<void>>();
+  auto recorded_offset = std::make_shared<std::atomic<std::int64_t>>(-1);
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory =
+      [unblock_primary, primary_closed, recorded_offset,
+       factory_calls](std::int64_t offset,
+                      std::optional<std::int64_t>)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    int call_count = ++*factory_calls;
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (call_count == 1) {
+      // Primary: read 1 succeeds ("chunk-1"), read 2 stalls.
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "chunk-1";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          })
+          .WillOnce([unblock_primary](char* buf, std::size_t) {
+            unblock_primary->get_future().get();
+            std::string const payload = "chunk-2-slow";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          });
+      EXPECT_CALL(*mock, Close).WillOnce([primary_closed]() {
+        primary_closed->set_value();
+        return make_status_or(HttpResponse{HttpStatusCode::kOk, {}, {}});
+      });
+    } else {
+      // Hedge: captures offset, provides chunk-2 and chunk-3.
+      recorded_offset->store(offset);
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "chunk-2-hedge";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          })
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "chunk-3";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          });
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(1),
+                                /*max_hedges=*/2, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+  EXPECT_THAT(r1->bytes_received, Eq(7));
+  EXPECT_THAT(std::string(buffer.data(), r1->bytes_received), Eq("chunk-1"));
+
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(r2->bytes_received, Eq(13));
+  EXPECT_THAT(std::string(buffer.data(), r2->bytes_received),
+              Eq("chunk-2-hedge"));
+  EXPECT_THAT(recorded_offset->load(), Eq(7));
+
+  unblock_primary->set_value();
+  primary_closed->get_future().get();
+
+  StatusOr<ReadSourceResult> r3 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r3, IsOk());
+  EXPECT_THAT(r3->bytes_received, Eq(7));
+  EXPECT_THAT(std::string(buffer.data(), r3->bytes_received), Eq("chunk-3"));
+  EXPECT_THAT(factory_calls->load(), Eq(2));
+}
+
+TEST(HedgedObjectReadSourceTest, SubsequentReadPinsGeneration) {
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+  auto primary_closed = std::make_shared<std::promise<void>>();
+  auto recorded_gen = std::make_shared<std::atomic<std::int64_t>>(-1);
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory =
+      [unblock_primary, primary_closed, recorded_gen,
+       factory_calls](std::int64_t,
+                      std::optional<std::int64_t> generation)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    int call_count = ++*factory_calls;
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (call_count == 1) {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "chunk-1";
+            std::copy(payload.begin(), payload.end(), buf);
+            ReadSourceResult r{payload.size(),
+                               HttpResponse{HttpStatusCode::kOk, {}, {}}};
+            r.generation = 987654321;
+            return r;
+          })
+          .WillOnce([unblock_primary](char* buf, std::size_t) {
+            unblock_primary->get_future().get();
+            std::string const payload = "chunk-2-slow";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          });
+      EXPECT_CALL(*mock, Close).WillOnce([primary_closed]() {
+        primary_closed->set_value();
+        return make_status_or(HttpResponse{HttpStatusCode::kOk, {}, {}});
+      });
+    } else {
+      if (generation) recorded_gen->store(*generation);
+      EXPECT_CALL(*mock, Read).WillOnce([](char* buf, std::size_t) {
+        std::string const payload = "chunk-2-hedge";
+        std::copy(payload.begin(), payload.end(), buf);
+        return MakeReadResult(payload);
+      });
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(1),
+                                /*max_hedges=*/1, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(recorded_gen->load(), Eq(987654321));
+
+  unblock_primary->set_value();
+  primary_closed->get_future().get();
+}
+
+TEST(HedgedObjectReadSourceTest, SubsequentReadGunzippedBypassesHedging) {
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory =
+      [factory_calls](std::int64_t,
+                      std::optional<std::int64_t>)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    ++*factory_calls;
+    auto mock = std::make_unique<MockObjectReadSource>();
+    EXPECT_CALL(*mock, Read)
+        .WillOnce([](char* buf, std::size_t) {
+          std::string const payload = "chunk-1";
+          std::copy(payload.begin(), payload.end(), buf);
+          ReadSourceResult r{payload.size(),
+                             HttpResponse{HttpStatusCode::kOk, {}, {}}};
+          r.transformation = "gunzipped";
+          return r;
+        })
+        .WillOnce([](char* buf, std::size_t) {
+          std::string const payload = "chunk-2";
+          std::copy(payload.begin(), payload.end(), buf);
+          return MakeReadResult(payload);
+        });
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  // Primary completes read 1 before delay, discovering gunzipped encoding.
+  // Subsequent read 2 must bypass hedging directly on the active child.
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(500),
+                                /*max_hedges=*/2, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(factory_calls->load(), Eq(1));
+}
+
+TEST(HedgedObjectReadSourceTest,
+     SubsequentReadHedgeFailureDoesNotAbortPrimary) {
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+  auto factory_calls = std::make_shared<std::atomic<int>>(0);
+
+  auto factory =
+      [unblock_primary,
+       factory_calls](std::int64_t,
+                      std::optional<std::int64_t>)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    int call_count = ++*factory_calls;
+    if (call_count == 1) {
+      auto mock = std::make_unique<MockObjectReadSource>();
+      EXPECT_CALL(*mock, Close).Times(::testing::AnyNumber());
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "chunk-1";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          })
+          .WillOnce([unblock_primary](char* buf, std::size_t) {
+            unblock_primary->get_future().get();
+            std::string const payload = "chunk-2-primary";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          });
+      return std::unique_ptr<ObjectReadSource>(std::move(mock));
+    }
+    return Status(StatusCode::kUnavailable, "hedge open error");
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(1),
+                                /*max_hedges=*/1, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+
+  std::thread unblocker([unblock_primary] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    unblock_primary->set_value();
+  });
+
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  unblocker.join();
+
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), r2->bytes_received),
+              Eq("chunk-2-primary"));
+  EXPECT_THAT(factory_calls->load(), Eq(2));
+}
+
+TEST(HedgedObjectReadSourceTest, SubsequentReadFromEndTracksOffset) {
+  auto unblock_primary = std::make_shared<std::promise<void>>();
+  auto primary_closed = std::make_shared<std::promise<void>>();
+  auto recorded_offset = std::make_shared<std::atomic<std::int64_t>>(-1);
+
+  auto factory =
+      [unblock_primary, primary_closed,
+       recorded_offset](std::int64_t offset,
+                        std::optional<std::int64_t>)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (recorded_offset->load() == -1) {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce([](char* buf, std::size_t) {
+            std::string const payload = "1234567890";  // 10 bytes
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          })
+          .WillOnce([unblock_primary](char* buf, std::size_t) {
+            unblock_primary->get_future().get();
+            std::string const payload = "slow";
+            std::copy(payload.begin(), payload.end(), buf);
+            return MakeReadResult(payload);
+          });
+      EXPECT_CALL(*mock, Close).WillOnce([primary_closed]() {
+        primary_closed->set_value();
+        return make_status_or(HttpResponse{HttpStatusCode::kOk, {}, {}});
+      });
+    } else {
+      recorded_offset->store(offset);
+      EXPECT_CALL(*mock, Read).WillOnce([](char* buf, std::size_t) {
+        std::string const payload = "hedge_data";
+        std::copy(payload.begin(), payload.end(), buf);
+        return MakeReadResult(payload);
+      });
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(
+      MakeUnlimitedReadPool(), MakeUnlimitedHedgePool(), factory,
+      std::chrono::milliseconds(1), /*max_hedges=*/1, kUnlimitedBuffer,
+      /*current_offset=*/100, /*offset_direction=*/kFromEnd,
+      /*generation=*/std::nullopt);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+  EXPECT_THAT(r1->bytes_received, Eq(10));
+
+  recorded_offset->store(0);
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(recorded_offset->load(), Eq(90));
+
+  unblock_primary->set_value();
+  primary_closed->get_future().get();
+}
+
+TEST(HedgedObjectReadSourceTest, SequentialReadsReuseStagingBuffer) {
+  auto factory = [](std::int64_t,
+                    std::optional<std::int64_t>)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    auto mock = std::make_unique<MockObjectReadSource>();
+    EXPECT_CALL(*mock, Read)
+        .WillOnce([](char* buf, std::size_t) {
+          std::string const payload = "chunk-1";
+          std::copy(payload.begin(), payload.end(), buf);
+          return MakeReadResult(payload);
+        })
+        .WillOnce([](char* buf, std::size_t) {
+          std::string const payload = "chunk-2";
+          std::copy(payload.begin(), payload.end(), buf);
+          return MakeReadResult(payload);
+        })
+        .WillOnce([](char* buf, std::size_t) {
+          std::string const payload = "chunk-3";
+          std::copy(payload.begin(), payload.end(), buf);
+          return MakeReadResult(payload);
+        });
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(500),
+                                /*max_hedges=*/2, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  StatusOr<ReadSourceResult> r1 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r1, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), r1->bytes_received), Eq("chunk-1"));
+
+  StatusOr<ReadSourceResult> r2 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r2, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), r2->bytes_received), Eq("chunk-2"));
+
+  StatusOr<ReadSourceResult> r3 = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(r3, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), r3->bytes_received), Eq("chunk-3"));
+}
+
 }  // namespace
 }  // namespace internal
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
