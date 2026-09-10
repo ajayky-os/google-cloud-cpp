@@ -140,7 +140,7 @@ int main(int argc, char* argv[]) {
 
   std::string bucket_name = argv[1];
   std::string object_name = argv[2];
-  int duration_minutes = std::stoi(argv[3]);
+  double duration_minutes = std::stod(argv[3]);
   int concurrency = (argc >= 5) ? std::stoi(argv[4]) : 10;
   long long read_size_bytes =
       (argc >= 6) ? std::stoll(argv[5]) : (50 * 1024 * 1024LL);
@@ -167,7 +167,7 @@ int main(int argc, char* argv[]) {
               gcs::ExponentialBackoffPolicy(std::chrono::milliseconds(1),
                                             std::chrono::milliseconds(2), 2.0)
                   .clone())
-          .set<gcs::ConnectionPoolSizeOption>(concurrency);
+          .set<gcs::ConnectionPoolSizeOption>(concurrency * 2);
 
   if (stall_timeout_secs > 0) {
     options.set<gcs::DownloadStallTimeoutOption>(
@@ -204,11 +204,13 @@ int main(int argc, char* argv[]) {
   }
 
   auto test_start = std::chrono::steady_clock::now();
-  auto target_duration = std::chrono::minutes(duration_minutes);
+  auto target_duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::duration<double, std::ratio<60>>(duration_minutes));
 
   auto worker_func = [&]() {
     std::vector<LatencyRecord> local_records;
-    local_records.reserve(duration_minutes * 60 * 10);
+    local_records.reserve(static_cast<std::size_t>(duration_minutes * 60 * 10));
 
     std::vector<char> buffer(chunk_size_bytes);
 
