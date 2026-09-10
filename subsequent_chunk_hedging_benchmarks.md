@@ -407,3 +407,113 @@ Each 50 MiB request reads fifty 1 MiB chunks. This metric isolates the single wo
 | **Total Latency (Mean)** | 53.52 ms | 57.61 ms | **53.87 ms** | +0.35 ms (+0.65%) | **-3.74 ms (-6.50%)** |
 | **Total Latency (p99)** | 143.79 ms | 167.75 ms | **137.74 ms** | -6.05 ms (-4.21%) | **-30.01 ms (-17.89%)** |
 | **Total Latency (p99.9)** | 348.99 ms | 318.94 ms | **288.91 ms** | **-60.09 ms (-17.22%)** | **-30.04 ms (-9.42%)** |
+
+---
+
+# Part V: Extended 15-Minute Benchmark: Unhedged vs Hedged (Reactive Fix)
+
+### Test Configuration:
+- **Binary**: `tail_latency_benchmark_chunk_fix` (reactive stall hedging on `feature/read-hedging-fix`)
+- **Execution Platform**: `us-central1` GCE VM (`artemis`, 10.128.0.63)
+- **Target Bucket / Object**: `ajayky-minerva` / `files/primitive_benchmark_500MB.parquet`
+- **Workload**: Concurrency 15, duration 15 minutes each, random offsets, chunk sizes: 2MB, 3MB, 5MB
+- **Hedging Parameters**: 500 ms delay, 30 hedge pool threads, connection pool size 60
+- **Scale**: **582,515 total requests executed**, **1.896 Terabytes transferred**, 100% success rate (0 errors)
+
+---
+
+## Executive Summary & Comparison (15-Minute Run)
+
+| Metric | Unhedged Baseline | Hedged (Reactive Fix) | Delta (Hedged vs Unhedged) |
+| :--- | :---: | :---: | :---: |
+| **Total Completed Requests** | 287,616 | **294,899** | **+7,283 (+2.53%)** |
+| **Throughput (QPS)** | 319.6 req/s | **327.7 req/s** | **+8.1 req/s (+2.53%)** |
+| **Data Transferred** | 935.81 GB | **960.13 GB** | **+24.32 GB** |
+| **Open Latency (Max)** | 2,798.34 ms | **594.36 ms** | **-2,203.98 ms (-78.76%)** |
+| **Open Latency (p99.9)** | 224.11 ms | **197.39 ms** | **-26.72 ms (-11.92%)** |
+| **Open Latency (p99)** | 96.99 ms | **88.28 ms** | **-8.72 ms (-8.99%)** |
+| **Open Latency (p95)** | 56.89 ms | **52.70 ms** | **-4.19 ms (-7.37%)** |
+| **Open Latency (p90)** | 46.68 ms | **44.11 ms** | **-2.57 ms (-5.50%)** |
+| **Total Latency (Max)** | 3,532.48 ms | **2,331.97 ms** | **-1,200.51 ms (-33.98%)** |
+| **Total Latency (p99)** | 129.87 ms | **119.74 ms** | **-10.13 ms (-7.80%)** |
+| **Total Latency (p95)** | 77.31 ms | **72.73 ms** | **-4.58 ms (-5.93%)** |
+| **Total Latency (Mean)** | 46.90 ms | **45.74 ms** | **-1.16 ms (-2.48%)** |
+| **Max Chunk Latency (Max)** | 3,027.20 ms | **1,569.96 ms** | **-1,457.24 ms (-48.14%)** |
+| **Max Chunk Latency (p99)** | 23.82 ms | **21.30 ms** | **-2.53 ms (-10.60%)** |
+| **Max Chunk Latency (p95)** | 11.72 ms | **10.59 ms** | **-1.13 ms (-9.65%)** |
+| **Success Rate** | 100% (0 errors) | **100% (0 errors)** | 0 errors |
+
+### Key Findings:
+1. **Net Positive Throughput Gain (+2.53%)**:
+   - In the longer 15-minute test, Hedging actually delivered **higher total throughput** (+7,283 requests / +24.3 GB) than Unhedged.
+   - When slow connections and stalls occur in the unhedged run (stalls reached up to 2.4s - 3.0s), unhedged worker threads become blocked and lose throughput. Reactive hedging re-raced those stalled chunks, unblocking worker threads much faster.
+2. **Elimination of Multi-Second Open Tails (-78.8%)**:
+   - The unhedged baseline suffered connection/open stalls up to **2.80 seconds** (`2,798.34 ms`).
+   - Hedging capped the maximum open latency to **594.36 ms** (**2.2 seconds cut from the tail**).
+3. **Chunk Tail Clamping Across All Sizes**:
+   - Maximum single 1MB chunk latency dropped from **3,027.20 ms** down to **1,569.96 ms** (-48.14%).
+   - p99 and p95 chunk latencies were consistently **~10% faster**.
+
+---
+
+## 15-Minute Detailed Size Breakdown
+
+### 2 MiB Chunks (2,097,152 bytes)
+- **Completed Requests**: Unhedged = 95,776 | Hedged = **98,204 (+2,428, +2.54%)**
+
+| Metric / Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged |
+| :--- | :---: | :---: | :---: |
+| **Open Latency (Max)** | 1,945.68 ms | **594.36 ms** | **-1,351.32 ms (-69.45%)** |
+| **Open Latency (p99.9)** | 212.62 ms | **194.23 ms** | **-18.40 ms (-8.65%)** |
+| **Open Latency (p99)** | 91.70 ms | **85.23 ms** | **-6.47 ms (-7.06%)** |
+| **Open Latency (p95)** | 55.10 ms | **51.15 ms** | **-3.96 ms (-7.18%)** |
+| **Open Latency (Mean)** | 33.80 ms | **32.58 ms** | -1.22 ms (-3.60%) |
+| **Total Latency (Mean)** | 40.41 ms | **39.52 ms** | -0.89 ms (-2.20%) |
+| **Total Latency (p95)** | 64.75 ms | **60.63 ms** | **-4.12 ms (-6.36%)** |
+| **Total Latency (p99)** | 105.76 ms | **99.64 ms** | **-6.12 ms (-5.78%)** |
+| **Total Latency (Max)** | 1,961.96 ms | **1,863.69 ms** | -98.27 ms (-5.01%) |
+| **Max Chunk Latency (p99)** | 14.94 ms | **14.36 ms** | -0.58 ms (-3.86%) |
+| **Max Chunk Latency (p95)** | 7.97 ms | **7.59 ms** | -0.39 ms (-4.87%) |
+
+### 3 MiB Chunks (3,145,728 bytes)
+- **Completed Requests**: Unhedged = 96,242 | Hedged = **98,357 (+2,115, +2.20%)**
+
+| Metric / Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged |
+| :--- | :---: | :---: | :---: |
+| **Open Latency (Max)** | 2,798.34 ms | **573.33 ms** | **-2,225.01 ms (-79.51%)** |
+| **Open Latency (p99.9)** | 234.71 ms | **196.40 ms** | **-38.31 ms (-16.32%)** |
+| **Open Latency (p99)** | 99.11 ms | **88.82 ms** | **-10.29 ms (-10.39%)** |
+| **Open Latency (p95)** | 58.05 ms | **53.51 ms** | **-4.54 ms (-7.82%)** |
+| **Open Latency (Mean)** | 35.45 ms | **33.95 ms** | -1.50 ms (-4.24%) |
+| **Read Latency (Max)** | 3,051.35 ms | **1,619.95 ms** | **-1,431.40 ms (-46.91%)** |
+| **Total Latency (Mean)** | 46.29 ms | **44.94 ms** | -1.35 ms (-2.92%) |
+| **Total Latency (p90)** | 61.67 ms | **58.57 ms** | **-3.10 ms (-5.02%)** |
+| **Total Latency (p95)** | 74.87 ms | **69.37 ms** | **-5.50 ms (-7.35%)** |
+| **Total Latency (p99)** | 126.75 ms | **114.75 ms** | **-12.00 ms (-9.47%)** |
+| **Total Latency (Max)** | 3,532.48 ms | **1,922.27 ms** | **-1,610.21 ms (-45.58%)** |
+| **Max Chunk Latency (Max)** | 3,027.20 ms | **1,569.96 ms** | **-1,457.24 ms (-48.14%)** |
+| **Max Chunk Latency (p99)** | 22.28 ms | **20.24 ms** | **-2.04 ms (-9.14%)** |
+| **Max Chunk Latency (p95)** | 10.92 ms | **9.96 ms** | **-0.97 ms (-8.84%)** |
+
+### 5 MiB Chunks (5,242,880 bytes)
+- **Completed Requests**: Unhedged = 95,598 | Hedged = **98,338 (+2,740, +2.87%)**
+
+| Metric / Percentile | Unhedged Baseline | Hedged (Reactive Fix) | Delta vs Unhedged |
+| :--- | :---: | :---: | :---: |
+| **Open Latency (Max)** | 1,465.55 ms | **563.48 ms** | **-902.07 ms (-61.55%)** |
+| **Open Latency (p99.9)** | 229.65 ms | **198.65 ms** | **-30.99 ms (-13.50%)** |
+| **Open Latency (p99)** | 100.20 ms | **90.44 ms** | **-9.76 ms (-9.74%)** |
+| **Open Latency (p95)** | 57.59 ms | **53.49 ms** | **-4.10 ms (-7.11%)** |
+| **Open Latency (Mean)** | 34.58 ms | **33.30 ms** | -1.28 ms (-3.70%) |
+| **Read Latency (p99)** | 60.21 ms | **57.15 ms** | **-3.06 ms (-5.08%)** |
+| **Read Latency (Max)** | 2,447.56 ms | **2,232.79 ms** | -214.77 ms (-8.77%) |
+| **Total Latency (Mean)** | 54.03 ms | **52.75 ms** | -1.28 ms (-2.37%) |
+| **Total Latency (p95)** | 88.01 ms | **83.12 ms** | **-4.88 ms (-5.55%)** |
+| **Total Latency (p99)** | 150.09 ms | **138.26 ms** | **-11.83 ms (-7.88%)** |
+| **Total Latency (p99.9)** | 330.37 ms | **320.32 ms** | -10.05 ms (-3.04%) |
+| **Total Latency (Max)** | 3,050.67 ms | **2,331.97 ms** | **-718.70 ms (-23.56%)** |
+| **Max Chunk Latency (Max)** | 2,426.54 ms | **1,201.30 ms** | **-1,225.24 ms (-50.49%)** |
+| **Max Chunk Latency (p99)** | 31.67 ms | **27.41 ms** | **-4.26 ms (-13.46%)** |
+| **Max Chunk Latency (p95)** | 15.05 ms | **13.29 ms** | **-1.76 ms (-11.68%)** |
+| **Max Chunk Latency (p90)** | 11.14 ms | **9.81 ms** | **-1.33 ms (-11.94%)** |
+
