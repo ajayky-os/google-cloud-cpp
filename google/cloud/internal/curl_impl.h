@@ -15,6 +15,7 @@
 #ifndef GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_INTERNAL_CURL_IMPL_H
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_INTERNAL_CURL_IMPL_H
 
+#include "google/cloud/internal/cancellation_token.h"
 #include "google/cloud/internal/curl_handle.h"
 #include "google/cloud/internal/curl_handle_factory.h"
 #include "google/cloud/internal/curl_wrappers.h"
@@ -155,6 +156,14 @@ class CurlImpl {
   Status OnTransferError(RestContext& context, Status status);
   void OnTransferDone();
 
+  // Returns `kCancelled` once the request's cancellation token (if any) has
+  // been cancelled.
+  Status CheckCancelled() const;
+  // Let `CancellationToken::Cancel()` interrupt `WaitForHandles()` for as long
+  // as `multi_` is in use by this object.
+  void RegisterWakeup();
+  void UnregisterWakeup();
+
   std::shared_ptr<CurlHandleFactory> factory_;
   std::vector<HttpHeader> pending_request_headers_;
   CurlHeaders request_headers_;
@@ -179,6 +188,8 @@ class CurlImpl {
   std::optional<experimental::SslCertificate> client_ssl_cert_ = std::nullopt;
 
   std::optional<std::string> interface_;
+
+  std::shared_ptr<CancellationToken> cancel_;
 
   CurlReceivedHeaders received_headers_;
   std::string url_;

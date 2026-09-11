@@ -236,6 +236,10 @@ CurlImpl::CurlImpl(CurlHandle handle,
   }
 
   interface_ = CurlOptInterface(options);
+
+  if (options.has<CancellationTokenOption>()) {
+    cancel_ = options.get<CancellationTokenOption>();
+  }
 }
 
 CurlImpl::~CurlImpl() {
@@ -264,6 +268,7 @@ CurlImpl::~CurlImpl() {
 
   CleanupHandles();
 
+  UnregisterWakeup();
   CurlHandle::ReturnToPool(*factory_, std::move(handle_));
   factory_->CleanupMultiHandle(std::move(multi_), HandleDisposition::kKeep);
 }
@@ -667,6 +672,10 @@ Status CurlImpl::MakeRequestImpl(RestContext& context) {
   handle_.SetOptionUnchecked(CURLOPT_HTTP_VERSION,
                              VersionToCurlCode(http_version_));
 
+  // A request cancelled before it starts must not send anything.
+  status = CheckCancelled();
+  if (!status.ok()) return OnTransferError(context, std::move(status));
+
   auto error = curl_multi_add_handle(multi_.get(), handle_.handle_.get());
 
   // This indicates that we are using the API incorrectly. The application
@@ -677,6 +686,7 @@ Status CurlImpl::MakeRequestImpl(RestContext& context) {
   }
 
   in_multi_ = true;
+  RegisterWakeup();
 
   // This call to Read() should send the request, get the response, and
   // thus make available the status_code and headers. Any response data
@@ -854,6 +864,10 @@ Status CurlImpl::PerformWorkUntil(absl::FunctionRef<bool()> predicate) {
     // it might continue to be unsatisfied even though the handles have
     // completed their work.
     if (*running_handles == 0 || predicate()) break;
+    // Check right before blocking: a cancellation interrupts the wait (see
+    // RegisterWakeup()), and the next iteration lands here again.
+    auto cancelled = CheckCancelled();
+    if (!cancelled.ok()) return cancelled;
     auto status = WaitForHandles(repeats);
     if (!status.ok()) return status;
   }
@@ -906,6 +920,7 @@ Status CurlImpl::OnTransferError(RestContext& context, Status status) {
   // When there is a transfer error the handle is suspect. It could be pointing
   // to an invalid host, a host that is slow and trickling data, or otherwise
   // be in a bad state. Release the handle, but do not return it to the pool.
+  UnregisterWakeup();
   CleanupHandles();
   CurlHandle::DiscardFromPool(*factory_, std::move(handle_));
 
@@ -924,8 +939,33 @@ void CurlImpl::OnTransferDone() {
   // handle_ was removed from multi_ as part of the transfer completing
   // in PerformWork(). Release the handles back to the factory as soon as
   // possible, so they can be reused for any other requests.
+  UnregisterWakeup();
   CurlHandle::ReturnToPool(*factory_, std::move(handle_));
   factory_->CleanupMultiHandle(std::move(multi_), HandleDisposition::kKeep);
+}
+
+Status CurlImpl::CheckCancelled() const {
+  if (!cancel_ || !cancel_->cancelled()) return {};
+  return internal::CancelledError("transfer cancelled by the application",
+                                  GCP_ERROR_INFO());
+}
+
+void CurlImpl::RegisterWakeup() {
+  if (!cancel_ || !multi_) return;
+#if CURL_AT_LEAST_VERSION(7, 68, 0)
+  // curl_multi_wakeup() is safe to call from any thread, and returns
+  // immediately. Without it a cancellation is still detected, at the next
+  // WaitForHandles() timeout.
+  cancel_->AddWakeup(multi_.get(),
+                     [m = multi_.get()] { (void)curl_multi_wakeup(m); });
+#endif
+}
+
+void CurlImpl::UnregisterWakeup() {
+  if (!cancel_ || !multi_) return;
+  // The CURLM* is about to be reused by another transfer, which must not be
+  // woken up by a cancellation of this one.
+  cancel_->RemoveWakeup(multi_.get());
 }
 
 std::optional<std::string> CurlOptProxy(Options const& options) {

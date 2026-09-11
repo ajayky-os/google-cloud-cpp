@@ -21,6 +21,7 @@
 #include <future>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace google {
 namespace cloud {
@@ -29,12 +30,21 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 namespace {
 
+using ::google::cloud::rest_internal::CancellationToken;
+
 struct RaceResult {
   StatusOr<ReadSourceResult> result;
   std::unique_ptr<ObjectReadSource> source;
   std::unique_ptr<char[]> buffer;
   std::size_t buffer_capacity = 0;
+  std::shared_ptr<CancellationToken> cancel;
 };
+
+RaceResult ErrorResult(Status status) {
+  RaceResult result;
+  result.result = std::move(status);
+  return result;
+}
 
 // Shared between the caller, which schedules the attempts and waits for the
 // winner, and the attempts themselves, which may outlive the caller's wait.
@@ -53,11 +63,31 @@ struct RaceState {
   std::mutex mu;
   Status primary_error;  // GUARDED_BY(mu)
   Status last_error;     // GUARDED_BY(mu)
+  // The cancellation token of every attempt in this race.
+  std::vector<std::shared_ptr<CancellationToken>> attempts;  // GUARDED_BY(mu)
 
   // Returns true for exactly one caller: the one that gets to set the result.
   bool TryClaim() {
     bool expected = false;
     return resolved.compare_exchange_strong(expected, true);
+  }
+
+  // Registers an attempt before it is dispatched. An attempt registered after
+  // the race was decided cannot win anymore, and is cancelled at once.
+  void AddAttempt(std::shared_ptr<CancellationToken> const& cancel) {
+    std::lock_guard<std::mutex> lock(mu);
+    attempts.push_back(cancel);
+    if (resolved.load()) cancel->Cancel();
+  }
+
+  // Cancels every attempt but @p winner (null when the race ended in error).
+  // Must be called after `TryClaim()` succeeded, so that `AddAttempt()` and
+  // this function agree on which attempts to cancel.
+  void CancelLosers(CancellationToken const* winner) {
+    std::lock_guard<std::mutex> lock(mu);
+    for (auto const& attempt : attempts) {
+      if (attempt.get() != winner) attempt->Cancel();
+    }
   }
 
   // The error reported when every attempt fails. The primary describes the
@@ -75,7 +105,7 @@ struct RaceState {
   void RetireAttempt() {
     if (active_attempts.fetch_sub(1) != 1) return;
     if (!TryClaim()) return;
-    promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+    promise.set_value(ErrorResult(FinalError()));
   }
 
   void Fail(Status status, bool is_primary) {
@@ -93,7 +123,8 @@ struct RaceState {
     // access is denied, ...). Report it now instead of holding the caller
     // until every in-flight hedge has exhausted its own retry budget.
     if (permanent && TryClaim()) {
-      promise.set_value(RaceResult{FinalError(), nullptr, nullptr});
+      CancelLosers(nullptr);
+      promise.set_value(ErrorResult(FinalError()));
     }
     RetireAttempt();
   }
@@ -101,15 +132,18 @@ struct RaceState {
 
 // Runs a single read attempt. The primary attempt reads from the active child
 // when the stream has one, any other attempt opens a new child at @p offset
-// and @p generation. A successful read resolves the race immediately; the
-// loser closes its own child. A failed attempt only resolves the race if it
-// is the last one standing, or if it is the primary failing permanently.
+// and @p generation. A successful read resolves the race immediately and
+// cancels the other attempts; a loser closes its own child once its read
+// returns, typically with `kCancelled`. A failed attempt only resolves the
+// race if it is the last one standing, or if it is the primary failing
+// permanently.
 void RunAttempt(std::shared_ptr<RaceState> const& state,
                 HedgedObjectReadSource::ChildFactory const& factory,
                 std::unique_ptr<ObjectReadSource> child,
                 std::unique_ptr<char[]> buffer, std::size_t buffer_capacity,
                 std::int64_t offset, std::optional<std::int64_t> generation,
-                std::size_t n, bool is_primary,
+                std::shared_ptr<CancellationToken> cancel, std::size_t n,
+                bool is_primary,
                 std::shared_ptr<HedgingThreadPool> release_slot) {
   // Releases the acquired hedge concurrency slot upon function exit across
   // all code paths. For the primary attempt, release_slot is nullptr.
@@ -121,7 +155,7 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
   } guard{std::move(release_slot)};
 
   if (!child) {
-    auto source = factory(offset, generation);
+    auto source = factory(offset, generation, cancel);
     if (!source) return state->Fail(std::move(source).status(), is_primary);
     child = *std::move(source);
   }
@@ -151,8 +185,10 @@ void RunAttempt(std::shared_ptr<RaceState> const& state,
     child->Close();
     return;
   }
+  state->CancelLosers(cancel.get());
   state->promise.set_value(RaceResult{std::move(result), std::move(child),
-                                      std::move(buffer), buffer_capacity});
+                                      std::move(buffer), buffer_capacity,
+                                      std::move(cancel)});
 }
 
 }  // namespace
@@ -237,13 +273,17 @@ bool HedgedObjectReadSource::AtEnd() const {
 StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadDirect(char* buf,
                                                               std::size_t n) {
   if (!active_child_) {
-    auto child = (*child_factory_)(current_offset_, generation_);
+    // The child gets a token even though nothing races it now: it may become
+    // the primary of a later race, and lose it.
+    auto cancel = std::make_shared<CancellationToken>();
+    auto child = (*child_factory_)(current_offset_, generation_, cancel);
     if (!child) {
       // The stream never opened, there is nothing to read from or to close.
       is_closed_ = true;
       return std::move(child).status();
     }
     active_child_ = *std::move(child);
+    active_cancel_ = std::move(cancel);
   }
   return active_child_->Read(buf, n);
 }
@@ -261,11 +301,18 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
   staging_buffer_.reset();
   staging_buffer_capacity_ = 0;
 
+  // The primary keeps the token of the active child, so that cancelling it
+  // reaches the child's in-flight transfer.
+  auto primary_cancel = std::move(active_cancel_);
+  if (!primary_cancel) primary_cancel = std::make_shared<CancellationToken>();
+  active_cancel_.reset();
+  state->AddAttempt(primary_cancel);
+
   auto primary = [state, factory = child_factory_, offset = current_offset_,
-                  gen = generation_, n] {
+                  gen = generation_, cancel = primary_cancel, n] {
     RunAttempt(state, *factory, std::move(state->primary_child),
                std::move(state->primary_buffer),
-               state->primary_buffer_capacity, offset, gen, n,
+               state->primary_buffer_capacity, offset, gen, cancel, n,
                /*is_primary=*/true, nullptr);
   };
   // The primary attempt is scheduled on the dedicated read pool.
@@ -288,11 +335,13 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
       continue;
     }
     state->active_attempts.fetch_add(1);
+    auto cancel = std::make_shared<CancellationToken>();
+    state->AddAttempt(cancel);
     auto hedge = [state, factory = child_factory_, offset = current_offset_,
-                  gen = generation_, n, pool = hedge_pool_] {
+                  gen = generation_, cancel, n, pool = hedge_pool_] {
       RunAttempt(state, *factory, /*child=*/nullptr, /*buffer=*/nullptr,
-                 /*buffer_capacity=*/0, offset, gen, n, /*is_primary=*/false,
-                 pool);
+                 /*buffer_capacity=*/0, offset, gen, cancel, n,
+                 /*is_primary=*/false, pool);
     };
     if (!hedge_pool_->Enqueue(hedge)) {
       hedge_pool_->ReleaseHedgeSlot();
@@ -304,6 +353,7 @@ StatusOr<ReadSourceResult> HedgedObjectReadSource::ReadRaced(char* buf,
 
   RaceResult race = future.get();
   active_child_ = std::move(race.source);
+  active_cancel_ = std::move(race.cancel);
   if (!race.result) {
     // Every attempt failed and closed its own child, there is nothing left to
     // read from or to close.

@@ -21,6 +21,7 @@ google_cloud_cpp_rest_internal_unit_tests = [
     "internal/curl_handle_factory_test.cc",
     "internal/curl_handle_test.cc",
     "internal/curl_http_payload_test.cc",
+    "internal/cancellation_token_test.cc",
     "internal/curl_impl_test.cc",
     "internal/curl_rest_client_test.cc",
     "internal/curl_wrappers_disable_sigpipe_handler_test.cc",

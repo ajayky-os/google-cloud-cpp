@@ -19,6 +19,7 @@
 #include "google/cloud/storage/parallel_upload.h"
 #include "google/cloud/internal/filesystem.h"
 #include "google/cloud/internal/opentelemetry.h"
+#include "google/cloud/internal/rest_options.h"
 #include "google/cloud/internal/rest_retry_loop.h"
 #include "google/cloud/log.h"
 #include "absl/strings/match.h"
@@ -400,13 +401,14 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
     ReadObjectRangeRequest const& request) {
   auto current = google::cloud::internal::SaveCurrentOptions();
 
-  auto self = shared_from_this();
   auto const* where = __func__;
-  auto factory = [self = shared_from_this(), current, where](
-                     ReadObjectRangeRequest const& request,
-                     RetryPolicy& retry_policy, BackoffPolicy& backoff_policy) {
+  // Opens one stream under @p options, which vary per hedged attempt.
+  auto open = [self = shared_from_this(), where](
+                  google::cloud::internal::ImmutableOptions const& options,
+                  ReadObjectRangeRequest const& request,
+                  RetryPolicy& retry_policy, BackoffPolicy& backoff_policy) {
     auto const idempotency =
-        current->get<IdempotencyPolicyOption>()->IsIdempotent(request)
+        options->get<IdempotencyPolicyOption>()->IsIdempotent(request)
             ? Idempotency::kIdempotent
             : Idempotency::kNonIdempotent;
     return RestRetryLoop(
@@ -417,7 +419,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
           context.AddHeader(kIdempotencyTokenHeader, token);
           return self->stub_->ReadObject(context, options, request);
         },
-        *current, request, where);
+        *options, request, where);
   };
 
   HedgedObjectReadSource::Position position;
@@ -437,8 +439,9 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   // the same request rewrite `RetryObjectReadSource` applies when it resumes
   // after a failure.
   auto child_factory =
-      [factory, current, request](std::int64_t current_offset,
-                                  std::optional<std::int64_t> generation)
+      [open, current, request](
+          std::int64_t current_offset, std::optional<std::int64_t> generation,
+          std::shared_ptr<rest_internal::CancellationToken> cancel)
       -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     ReadObjectRangeRequest req = request;
     if (req.HasOption<ReadLast>()) {
@@ -450,13 +453,29 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
     if (generation) {
       req.set_option(Generation(*generation));
     }
-    auto retry_policy = current->get<RetryPolicyOption>()->clone();
-    auto backoff_policy = current->get<BackoffPolicyOption>()->clone();
+    // A hedged attempt carries its own cancellation token in its options, so
+    // every transfer it makes, including the reconnects performed by
+    // `RetryObjectReadSource`, can be aborted when the attempt loses.
+    auto options = current;
+    if (cancel) {
+      Options attempt_options = *current;
+      attempt_options.set<rest_internal::CancellationTokenOption>(
+          std::move(cancel));
+      options = google::cloud::internal::MakeImmutableOptions(
+          std::move(attempt_options));
+    }
+    auto factory = [open, options](ReadObjectRangeRequest const& request,
+                                   RetryPolicy& retry_policy,
+                                   BackoffPolicy& backoff_policy) {
+      return open(options, request, retry_policy, backoff_policy);
+    };
+    auto retry_policy = options->get<RetryPolicyOption>()->clone();
+    auto backoff_policy = options->get<BackoffPolicyOption>()->clone();
     auto child = factory(req, *retry_policy, *backoff_policy);
     if (!child) return child;
     return std::unique_ptr<ObjectReadSource>(
         std::make_unique<RetryObjectReadSource>(
-            factory, current, std::move(req), *std::move(child),
+            factory, options, std::move(req), *std::move(child),
             std::move(retry_policy), std::move(backoff_policy)));
   };
 
@@ -469,7 +488,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
       current->get<storage_experimental::MaximumHedgeBufferOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_ || !read_pool_) {
-    return child_factory(position.offset, position.generation);
+    return child_factory(position.offset, position.generation, nullptr);
   }
 
   // `max_buffer` bounds the size of an individual read, which is only known

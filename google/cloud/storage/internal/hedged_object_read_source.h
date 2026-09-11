@@ -19,6 +19,7 @@
 #include "google/cloud/storage/internal/object_read_source.h"
 #include "google/cloud/storage/internal/retry_object_read_source.h"
 #include "google/cloud/storage/version.h"
+#include "google/cloud/internal/cancellation_token.h"
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -37,8 +38,10 @@ namespace internal {
  * The first `Read()` (the stream open) races a primary attempt against up to
  * @p max_hedges additional attempts created by @p child_factory, each started
  * after @p delay elapses without a winner. The first attempt to complete its
- * read wins and becomes the active child; losing attempts are closed when they
- * eventually complete.
+ * read wins and becomes the active child. Losing attempts are cancelled as
+ * soon as the race is decided, so they release their thread and connection
+ * right away instead of running until a stall timeout, and are closed when
+ * they complete.
  *
  * Later reads normally continue on the active child, on the caller's thread,
  * with no thread hops or copies. A read that takes longer than @p delay marks
@@ -63,11 +66,13 @@ class HedgedObjectReadSource : public ObjectReadSource {
    * With `kFromBeginning` the offset counts bytes from the start of the object,
    * with `kFromEnd` it is the number of bytes still to read from the end of the
    * object (`ReadLast`). The child must read the given @p generation when one
-   * is known.
+   * is known. The child's transfers, including any reconnects, must honor
+   * @p cancel: the source cancels an attempt as soon as it loses a race.
    */
   using ChildFactory =
       std::function<StatusOr<std::unique_ptr<ObjectReadSource>>(
-          std::int64_t current_offset, std::optional<std::int64_t> generation)>;
+          std::int64_t current_offset, std::optional<std::int64_t> generation,
+          std::shared_ptr<rest_internal::CancellationToken> cancel)>;
 
   /// Where the stream starts, as derived from the original request.
   struct Position {
@@ -127,6 +132,8 @@ class HedgedObjectReadSource : public ObjectReadSource {
   std::size_t staging_buffer_capacity_ = 0;
 
   std::unique_ptr<ObjectReadSource> active_child_;
+  // The token `active_child_` was opened with, cancelled if it loses a race.
+  std::shared_ptr<rest_internal::CancellationToken> active_cancel_;
   bool is_closed_ = false;
 };
 

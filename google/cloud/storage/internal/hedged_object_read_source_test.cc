@@ -33,10 +33,12 @@ GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace internal {
 namespace {
 
+using ::google::cloud::rest_internal::CancellationToken;
 using ::google::cloud::storage::testing::MockObjectReadSource;
 using ::google::cloud::testing_util::IsOk;
 using ::google::cloud::testing_util::StatusIs;
 using ::testing::Eq;
+using ::testing::NotNull;
 using ::testing::Return;
 
 // Large enough that no test read is treated as oversized.
@@ -61,10 +63,12 @@ std::shared_ptr<HedgingThreadPool> MakeUnlimitedHedgePool() {
       /*max_concurrent=*/0);
 }
 
-// Most tests do not care about the offset or generation a child is opened at.
+// Most tests do not care about the offset, generation, or cancellation token
+// a child is opened with.
 template <typename F>
 HedgedObjectReadSource::ChildFactory Adapt(F f) {
-  return [f = std::move(f)](std::int64_t, std::optional<std::int64_t>) {
+  return [f = std::move(f)](std::int64_t, std::optional<std::int64_t>,
+                            std::shared_ptr<CancellationToken>) {
     return f();
   };
 }
@@ -100,6 +104,22 @@ auto BlockedRead(std::shared_ptr<std::promise<void>> unblock,
     unblock->get_future().get();
     std::copy(payload.begin(), payload.end(), buf);
     return MakeReadResult(payload);
+  };
+}
+
+// A `Read()` action that blocks until @p cancel is cancelled, then sets
+// @p done and fails the way a cancelled transfer does. Such a child reports
+// itself closed, so the mock must not expect a `Close()`.
+auto ReadUntilCancelled(std::shared_ptr<CancellationToken> cancel,
+                        std::shared_ptr<std::promise<void>> done) {
+  return [cancel = std::move(cancel), done = std::move(done)](char*,
+                                                              std::size_t) {
+    while (!cancel->cancelled()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    done->set_value();
+    return StatusOr<ReadSourceResult>(
+        Status(StatusCode::kCancelled, "transfer cancelled"));
   };
 }
 
@@ -437,12 +457,13 @@ TEST(HedgedObjectReadSourceTest, PrimaryOpenErrorPropagates) {
 TEST(HedgedObjectReadSourceTest, PermanentPrimaryErrorResolvesImmediately) {
   // The primary fails with a permanent error while a hedge is in flight and
   // stalled. Waiting for the hedge cannot change the outcome, so the error
-  // must be reported at once, and the hedge must be closed when it completes.
-  auto unblock_hedge = std::make_shared<std::promise<void>>();
-  auto hedge_closed = std::make_shared<std::promise<void>>();
+  // must be reported at once, and the stalled hedge must be cancelled.
+  auto hedge_cancelled = std::make_shared<std::promise<void>>();
   auto calls = std::make_shared<std::atomic<int>>(0);
-  auto factory = [unblock_hedge, hedge_closed,
-                  calls]() -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+  auto factory = [hedge_cancelled, calls](
+                     std::int64_t, std::optional<std::int64_t>,
+                     std::shared_ptr<CancellationToken> cancel)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     auto mock = std::make_unique<MockObjectReadSource>();
     if (++*calls == 1) {
       // Fail after the hedge has been dispatched. The failed child reports
@@ -455,15 +476,17 @@ TEST(HedgedObjectReadSourceTest, PermanentPrimaryErrorResolvesImmediately) {
       EXPECT_CALL(*mock, IsOpen).WillRepeatedly(Return(false));
       EXPECT_CALL(*mock, Close).Times(0);
     } else {
-      EXPECT_CALL(*mock, Read).WillOnce(BlockedRead(unblock_hedge, "hedge"));
-      EXPECT_CALL(*mock, Close).WillOnce(NotifyClose(hedge_closed));
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(ReadUntilCancelled(std::move(cancel), hedge_cancelled));
+      EXPECT_CALL(*mock, IsOpen).WillRepeatedly(Return(false));
+      EXPECT_CALL(*mock, Close).Times(0);
     }
     return std::unique_ptr<ObjectReadSource>(std::move(mock));
   };
 
   HedgedObjectReadSource source(MakeUnlimitedReadPool(),
-                                MakeUnlimitedHedgePool(), Adapt(factory),
-                                kDelay, /*max_hedges=*/1, kUnlimitedBuffer);
+                                MakeUnlimitedHedgePool(), factory, kDelay,
+                                /*max_hedges=*/1, kUnlimitedBuffer);
 
   std::vector<char> buffer(100);
   auto result = source.Read(buffer.data(), buffer.size());
@@ -471,8 +494,94 @@ TEST(HedgedObjectReadSourceTest, PermanentPrimaryErrorResolvesImmediately) {
   EXPECT_THAT(calls->load(), Eq(2));
   EXPECT_FALSE(source.IsOpen());
 
-  unblock_hedge->set_value();
-  hedge_closed->get_future().get();
+  hedge_cancelled->get_future().get();
+}
+
+TEST(HedgedObjectReadSourceTest, LosingPrimaryIsCancelledWhenHedgeWins) {
+  // The primary stalls in its open read. Once the hedge wins, the primary's
+  // token must be cancelled so its transfer is aborted, and the hedge's token
+  // must not be.
+  auto primary_cancelled = std::make_shared<std::promise<void>>();
+  auto hedge_cancel = std::make_shared<std::shared_ptr<CancellationToken>>();
+  auto calls = std::make_shared<std::atomic<int>>(0);
+  auto factory = [primary_cancelled, hedge_cancel, calls](
+                     std::int64_t, std::optional<std::int64_t>,
+                     std::shared_ptr<CancellationToken> cancel)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    EXPECT_THAT(cancel, NotNull());
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (++*calls == 1) {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(ReadUntilCancelled(std::move(cancel), primary_cancelled));
+      EXPECT_CALL(*mock, IsOpen).WillRepeatedly(Return(false));
+      EXPECT_CALL(*mock, Close).Times(0);
+    } else {
+      *hedge_cancel = std::move(cancel);
+      EXPECT_CALL(*mock, Read).WillOnce(ImmediateRead("hedge"));
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory,
+                                std::chrono::milliseconds(1),
+                                /*max_hedges=*/1, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  auto result = source.Read(buffer.data(), buffer.size());
+  ASSERT_THAT(result, IsOk());
+  EXPECT_THAT(std::string(buffer.data(), result->bytes_received), Eq("hedge"));
+
+  primary_cancelled->get_future().get();
+  ASSERT_THAT(*hedge_cancel, NotNull());
+  EXPECT_FALSE((*hedge_cancel)->cancelled());
+}
+
+TEST(HedgedObjectReadSourceTest, LosingPrimaryIsCancelledMidStream) {
+  // The active child keeps the token it was opened with. When it stalls and
+  // loses a later race, that token is cancelled, and the winning hedge's token
+  // becomes the one a further race would cancel.
+  auto primary_cancelled = std::make_shared<std::promise<void>>();
+  auto tokens = std::make_shared<
+      std::vector<std::shared_ptr<CancellationToken>>>();
+  auto factory = [primary_cancelled, tokens](
+                     std::int64_t, std::optional<std::int64_t>,
+                     std::shared_ptr<CancellationToken> cancel)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+    EXPECT_THAT(cancel, NotNull());
+    tokens->push_back(cancel);
+    auto mock = std::make_unique<MockObjectReadSource>();
+    if (tokens->size() == 1) {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(ImmediateRead("chunk-1"))
+          .WillOnce(DelayedRead("chunk-2", kStall))
+          .WillOnce(ReadUntilCancelled(std::move(cancel), primary_cancelled));
+      EXPECT_CALL(*mock, IsOpen).WillRepeatedly(Return(false));
+      EXPECT_CALL(*mock, Close).Times(0);
+    } else {
+      EXPECT_CALL(*mock, Read)
+          .WillOnce(ImmediateRead("chunk-3-hedge"))
+          .WillOnce(ImmediateRead("chunk-4"));
+    }
+    return std::unique_ptr<ObjectReadSource>(std::move(mock));
+  };
+
+  HedgedObjectReadSource source(MakeUnlimitedReadPool(),
+                                MakeUnlimitedHedgePool(), factory, kDelay,
+                                /*max_hedges=*/1, kUnlimitedBuffer);
+
+  std::vector<char> buffer(100);
+  for (auto const* expected :
+       {"chunk-1", "chunk-2", "chunk-3-hedge", "chunk-4"}) {
+    auto result = source.Read(buffer.data(), buffer.size());
+    ASSERT_THAT(result, IsOk());
+    EXPECT_THAT(std::string(buffer.data(), result->bytes_received),
+                Eq(expected));
+  }
+  primary_cancelled->get_future().get();
+  ASSERT_THAT(tokens->size(), Eq(2));
+  EXPECT_TRUE((*tokens)[0]->cancelled());
+  EXPECT_FALSE((*tokens)[1]->cancelled());
 }
 
 TEST(HedgedObjectReadSourceTest, AllAttemptsFailReportsPrimaryError) {
@@ -538,10 +647,14 @@ TEST(HedgedObjectReadSourceTest, CloseBeforeRead) {
 
 TEST(HedgedObjectReadSourceTest, OversizedReadIsNotHedged) {
   // A read larger than the limit must open exactly one child and read into the
-  // caller's buffer, with no racing attempts to stage copies of the data.
+  // caller's buffer, with no racing attempts to stage copies of the data. The
+  // child still receives a token: it may lose a later race.
   auto calls = std::make_shared<std::atomic<int>>(0);
-  auto factory = [calls]() -> StatusOr<std::unique_ptr<ObjectReadSource>> {
+  auto factory = [calls](std::int64_t, std::optional<std::int64_t>,
+                         std::shared_ptr<CancellationToken> const& cancel)
+      -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     ++*calls;
+    EXPECT_THAT(cancel, NotNull());
     auto mock = std::make_unique<MockObjectReadSource>();
     EXPECT_CALL(*mock, Read).WillOnce(ImmediateRead("direct"));
     return std::unique_ptr<ObjectReadSource>(std::move(mock));
@@ -550,7 +663,7 @@ TEST(HedgedObjectReadSourceTest, OversizedReadIsNotHedged) {
   // A zero delay would let a hedge start immediately if the limit were not
   // honored, so any race would be observable as extra factory calls.
   HedgedObjectReadSource source(MakeUnlimitedReadPool(),
-                                MakeUnlimitedHedgePool(), Adapt(factory),
+                                MakeUnlimitedHedgePool(), factory,
                                 std::chrono::milliseconds(0),
                                 /*max_hedges=*/2, /*max_buffer=*/8);
 
@@ -616,7 +729,8 @@ TEST(HedgedObjectReadSourceTest, SubsequentReadHedgeWinsWhenPrimaryStalls) {
 
   auto factory = [unblock_primary, primary_closed, recorded_offset,
                   factory_calls](std::int64_t offset,
-                                 std::optional<std::int64_t>)
+                                 std::optional<std::int64_t>,
+                                 std::shared_ptr<CancellationToken>)
       -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     auto mock = std::make_unique<MockObjectReadSource>();
     if (++*factory_calls == 1) {
@@ -713,7 +827,8 @@ TEST(HedgedObjectReadSourceTest, SubsequentReadPinsGeneration) {
 
   auto factory = [unblock_primary, primary_closed, recorded_gen,
                   factory_calls](std::int64_t,
-                                 std::optional<std::int64_t> generation)
+                                 std::optional<std::int64_t> generation,
+                                 std::shared_ptr<CancellationToken>)
       -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     auto mock = std::make_unique<MockObjectReadSource>();
     if (++*factory_calls == 1) {
@@ -836,7 +951,8 @@ auto MakeOffsetRecordingFactory(
     std::shared_ptr<std::atomic<int>> const& factory_calls) {
   return [result = std::move(result), unblock_primary, primary_closed,
           recorded_offset,
-          factory_calls](std::int64_t offset, std::optional<std::int64_t>)
+          factory_calls](std::int64_t offset, std::optional<std::int64_t>,
+                         std::shared_ptr<CancellationToken>)
              -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     auto mock = std::make_unique<MockObjectReadSource>();
     if (++*factory_calls == 1) {
