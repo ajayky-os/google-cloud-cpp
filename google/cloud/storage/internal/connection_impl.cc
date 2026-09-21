@@ -43,6 +43,7 @@ namespace {
 using ::google::cloud::Idempotency;
 using ::google::cloud::internal::MergeOptions;
 using ::google::cloud::rest_internal::RestRetryLoop;
+using ::google::cloud::rest_internal::RestRetryLoopImpl;
 
 // Returns an error if the response contains an unexpected (or invalid)
 // committed size.
@@ -409,7 +410,15 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
         current->get<IdempotencyPolicyOption>()->IsIdempotent(request)
             ? Idempotency::kIdempotent
             : Idempotency::kNonIdempotent;
-    return RestRetryLoop(
+    // Equivalent to `RestRetryLoop()`, which builds exactly this sleeper, but
+    // with the backoff sleep named explicitly: read hedging needs to replace
+    // it with a sleeper that can be interrupted when the attempt loses its
+    // race and is left waiting out a backoff nobody is waiting for.
+    std::function<void(std::chrono::milliseconds)> sleeper =
+        [](std::chrono::milliseconds p) { std::this_thread::sleep_for(p); };
+    sleeper = google::cloud::internal::MakeTracedSleeper(
+        *current, std::move(sleeper), "Backoff");
+    return RestRetryLoopImpl(
         retry_policy, backoff_policy, idempotency,
         [self, token = self->MakeIdempotencyToken()](
             rest_internal::RestContext& context, Options const& options,
@@ -417,7 +426,7 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
           context.AddHeader(kIdempotencyTokenHeader, token);
           return self->stub_->ReadObject(context, options, request);
         },
-        *current, request, where);
+        *current, request, where, std::move(sleeper));
   };
 
   HedgedObjectReadSource::Position position;
@@ -457,10 +466,16 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
     StatusOr<std::unique_ptr<ObjectReadSource>> child =
         factory(req, *retry_policy, *backoff_policy);
     if (!child) return child;
+    // The same sleeper the constructor without this argument installs. Naming
+    // it here lets read hedging substitute an interruptible one, so a losing
+    // attempt does not hold a pool thread through a mid-stream retry backoff.
+    std::function<void(std::chrono::milliseconds)> backoff =
+        [](std::chrono::milliseconds p) { std::this_thread::sleep_for(p); };
     return std::unique_ptr<ObjectReadSource>(
         std::make_unique<RetryObjectReadSource>(
             factory, current, std::move(req), *std::move(child),
-            std::move(retry_policy), std::move(backoff_policy)));
+            std::move(retry_policy), std::move(backoff_policy),
+            std::move(backoff)));
   };
 
   auto const enable_hedging =
