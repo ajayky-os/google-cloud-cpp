@@ -14,8 +14,11 @@
 
 #include "google/cloud/internal/curl_impl.h"
 #include "google/cloud/common_options.h"
+#include "google/cloud/internal/rest_options.h"
 #include "google/cloud/rest_options.h"
+#include "google/cloud/testing_util/status_matchers.h"
 #include <gmock/gmock.h>
+#include <memory>
 #include <vector>
 
 namespace google {
@@ -24,6 +27,7 @@ namespace rest_internal {
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_BEGIN
 namespace {
 
+using ::google::cloud::testing_util::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::Eq;
 
@@ -419,6 +423,19 @@ TEST(NoProxyValueTest, MakeNoProxyValueEmpty) {
 
 TEST(NoProxyValueTest, NoProxyValue) {
   EXPECT_THAT(NoProxyValue(), testing::HasSubstr("metadata.google.internal"));
+}
+
+TEST_F(CurlImplTest, CancelledTokenFailsBeforeSendingTheRequest) {
+  // The URL is never contacted: the request stops at the cancellation check
+  // that runs before the handle joins the multi handle.
+  auto cancel = std::make_shared<CancellationToken>();
+  cancel->Cancel();
+  auto impl = CurlImpl(std::move(handle_), factory_,
+                       Options{}.set<CancellationTokenOption>(cancel));
+  impl.SetUrl("https://invalid.invalid", {}, {});
+  RestContext context;
+  EXPECT_THAT(impl.MakeRequest(CurlImpl::HttpMethod::kGet, context),
+              StatusIs(StatusCode::kCancelled));
 }
 
 }  // namespace

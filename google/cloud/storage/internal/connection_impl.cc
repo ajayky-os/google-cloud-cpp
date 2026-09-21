@@ -19,6 +19,7 @@
 #include "google/cloud/storage/parallel_upload.h"
 #include "google/cloud/internal/filesystem.h"
 #include "google/cloud/internal/opentelemetry.h"
+#include "google/cloud/internal/rest_options.h"
 #include "google/cloud/internal/rest_retry_loop.h"
 #include "google/cloud/log.h"
 #include "absl/strings/match.h"
@@ -403,31 +404,39 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
 
   auto self = shared_from_this();
   auto const* where = __func__;
-  auto factory = [self = shared_from_this(), current, where](
-                     ReadObjectRangeRequest const& request,
-                     RetryPolicy& retry_policy, BackoffPolicy& backoff_policy) {
-    auto const idempotency =
-        current->get<IdempotencyPolicyOption>()->IsIdempotent(request)
-            ? Idempotency::kIdempotent
-            : Idempotency::kNonIdempotent;
-    // Equivalent to `RestRetryLoop()`, which builds exactly this sleeper, but
-    // with the backoff sleep named explicitly: read hedging needs to replace
-    // it with a sleeper that can be interrupted when the attempt loses its
-    // race and is left waiting out a backoff nobody is waiting for.
-    std::function<void(std::chrono::milliseconds)> sleeper =
-        [](std::chrono::milliseconds p) { std::this_thread::sleep_for(p); };
-    sleeper = google::cloud::internal::MakeTracedSleeper(
-        *current, std::move(sleeper), "Backoff");
-    return RestRetryLoopImpl(
-        retry_policy, backoff_policy, idempotency,
-        [self, token = self->MakeIdempotencyToken()](
-            rest_internal::RestContext& context, Options const& options,
-            ReadObjectRangeRequest const& request) {
-          context.AddHeader(kIdempotencyTokenHeader, token);
-          return self->stub_->ReadObject(context, options, request);
-        },
-        *current, request, where, std::move(sleeper));
-  };
+  // Opens one stream under @p options, which carry the cancellation token of
+  // the hedged attempt making the call (if any).
+  auto open =
+      [self = shared_from_this(), where](
+          google::cloud::internal::ImmutableOptions const& options,
+          std::shared_ptr<rest_internal::CancellationToken> const& cancel,
+          ReadObjectRangeRequest const& request, RetryPolicy& retry_policy,
+          BackoffPolicy& backoff_policy) {
+        auto const idempotency =
+            options->get<IdempotencyPolicyOption>()->IsIdempotent(request)
+                ? Idempotency::kIdempotent
+                : Idempotency::kNonIdempotent;
+        // `RestRetryLoop()` builds exactly this sleeper. It is spelled out here
+        // so a cancelled attempt does not hold its pool thread for the rest of
+        // a backoff whose result nobody will use: the retry policy treats
+        // `kCancelled` as permanent, so waking early ends the loop.
+        std::function<void(std::chrono::milliseconds)> sleeper =
+            [cancel](std::chrono::milliseconds p) {
+              if (cancel) return static_cast<void>(cancel->WaitFor(p));
+              std::this_thread::sleep_for(p);
+            };
+        sleeper = google::cloud::internal::MakeTracedSleeper(
+            *options, std::move(sleeper), "Backoff");
+        return RestRetryLoopImpl(
+            retry_policy, backoff_policy, idempotency,
+            [self, token = self->MakeIdempotencyToken()](
+                rest_internal::RestContext& context, Options const& options,
+                ReadObjectRangeRequest const& request) {
+              context.AddHeader(kIdempotencyTokenHeader, token);
+              return self->stub_->ReadObject(context, options, request);
+            },
+            *options, request, where, std::move(sleeper));
+      };
 
   HedgedObjectReadSource::Position position;
   position.direction =
@@ -445,9 +454,15 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
   // Creates a `RetryObjectReadSource` positioned at `current_offset`, this is
   // the same request rewrite `RetryObjectReadSource` applies when it resumes
   // after a failure.
-  auto child_factory = [factory, current, request](
-                           std::int64_t current_offset,
-                           std::optional<std::int64_t> generation)
+  //
+  // @p cancel is the token of the hedged attempt this stream belongs to, or
+  // null outside read hedging. It is installed in the options the source keeps,
+  // so the token covers the first transfer and every reconnect the source makes
+  // later, as well as the waits between them.
+  auto child_factory =
+      [open, current, request](
+          std::int64_t current_offset, std::optional<std::int64_t> generation,
+          std::shared_ptr<rest_internal::CancellationToken> cancel)
       -> StatusOr<std::unique_ptr<ObjectReadSource>> {
     ReadObjectRangeRequest req = request;
     if (req.HasOption<ReadLast>()) {
@@ -459,6 +474,19 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
     if (generation) {
       req.set_option(Generation(*generation));
     }
+    google::cloud::internal::ImmutableOptions options = current;
+    if (cancel) {
+      Options cancellable = *current;
+      cancellable.set<rest_internal::CancellationTokenOption>(cancel);
+      options =
+          google::cloud::internal::MakeImmutableOptions(std::move(cancellable));
+    }
+    RetryObjectReadSource::ReadSourceFactory factory =
+        [open, options, cancel](ReadObjectRangeRequest const& request,
+                                RetryPolicy& retry_policy,
+                                BackoffPolicy& backoff_policy) {
+          return open(options, cancel, request, retry_policy, backoff_policy);
+        };
     std::unique_ptr<RetryPolicy> retry_policy =
         current->get<RetryPolicyOption>()->clone();
     std::unique_ptr<BackoffPolicy> backoff_policy =
@@ -466,16 +494,19 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
     StatusOr<std::unique_ptr<ObjectReadSource>> child =
         factory(req, *retry_policy, *backoff_policy);
     if (!child) return child;
-    // The same sleeper the constructor without this argument installs. Naming
-    // it here lets read hedging substitute an interruptible one, so a losing
-    // attempt does not hold a pool thread through a mid-stream retry backoff.
+    // The same sleeper the constructor without this argument installs, except
+    // that a cancelled attempt wakes from it immediately instead of holding a
+    // pool thread through a mid-stream retry backoff nobody is waiting for.
     std::function<void(std::chrono::milliseconds)> backoff =
-        [](std::chrono::milliseconds p) { std::this_thread::sleep_for(p); };
+        [cancel](std::chrono::milliseconds p) {
+          if (cancel) return static_cast<void>(cancel->WaitFor(p));
+          std::this_thread::sleep_for(p);
+        };
     return std::unique_ptr<ObjectReadSource>(
         std::make_unique<RetryObjectReadSource>(
-            factory, current, std::move(req), *std::move(child),
-            std::move(retry_policy), std::move(backoff_policy),
-            std::move(backoff)));
+            std::move(factory), std::move(options), std::move(req),
+            *std::move(child), std::move(retry_policy),
+            std::move(backoff_policy), std::move(backoff)));
   };
 
   auto const enable_hedging =
@@ -487,7 +518,10 @@ StatusOr<std::unique_ptr<ObjectReadSource>> StorageConnectionImpl::ReadObject(
       current->get<storage_experimental::MaximumHedgeBufferOption>();
 
   if (!enable_hedging || max_hedges <= 0 || !hedge_pool_ || !read_pool_) {
-    return child_factory(position.offset, position.generation);
+    // Without hedging there is no race to lose, so no token is installed and
+    // the transport behaves exactly as it did before.
+    return child_factory(position.offset, position.generation,
+                         /*cancel=*/nullptr);
   }
 
   // `max_buffer` bounds the size of an individual read, which is only known

@@ -15,6 +15,7 @@
 #ifndef GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_INTERNAL_REST_OPTIONS_H
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_INTERNAL_REST_OPTIONS_H
 
+#include "google/cloud/internal/cancellation_token.h"
 #include "google/cloud/options.h"
 #include "google/cloud/version.h"
 #include <chrono>
@@ -116,12 +117,23 @@ struct TargetApiVersionOption {
   using Type = std::string;
 };
 
+/**
+ * Aborts the HTTP transfers of a request from another thread.
+ *
+ * Transfers started with this option fail with `kCancelled` as soon as the
+ * token is cancelled, instead of running until they complete or a stall
+ * timeout fires. See `CancellationToken` for the details.
+ */
+struct CancellationTokenOption {
+  using Type = std::shared_ptr<CancellationToken>;
+};
+
 /// The complete list of options accepted by `CurlRestClient`
 using RestInternalOptionList = ::google::cloud::OptionList<
     HttpConnectTimeoutOption, TransferStallTimeoutOption,
     TransferStallMinimumRateOption, DownloadStallTimeoutOption,
     DownloadStallMinimumRateOption, LongrunningEndpointOption,
-    TargetApiVersionOption>;
+    TargetApiVersionOption, CancellationTokenOption>;
 
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace rest_internal

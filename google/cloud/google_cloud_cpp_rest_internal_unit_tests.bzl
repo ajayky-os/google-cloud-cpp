@@ -18,6 +18,7 @@
 
 google_cloud_cpp_rest_internal_unit_tests = [
     "internal/binary_data_as_debug_string_test.cc",
+    "internal/cancellation_token_test.cc",
     "internal/curl_handle_factory_test.cc",
     "internal/curl_handle_test.cc",
     "internal/curl_http_payload_test.cc",

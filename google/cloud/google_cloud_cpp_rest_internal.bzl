@@ -18,6 +18,7 @@
 
 google_cloud_cpp_rest_internal_hdrs = [
     "internal/binary_data_as_debug_string.h",
+    "internal/cancellation_token.h",
     "internal/curl_handle.h",
     "internal/curl_handle_factory.h",
     "internal/curl_http_payload.h",

@@ -25,6 +25,7 @@ add_library(
     google_cloud_cpp_rest_internal # cmake-format: sort
     internal/binary_data_as_debug_string.cc
     internal/binary_data_as_debug_string.h
+    internal/cancellation_token.h
     internal/curl_handle.cc
     internal/curl_handle.h
     internal/curl_handle_factory.cc
@@ -260,6 +261,7 @@ if (BUILD_TESTING)
     set(google_cloud_cpp_rest_internal_unit_tests
         # cmake-format: sort
         internal/binary_data_as_debug_string_test.cc
+        internal/cancellation_token_test.cc
         internal/curl_handle_factory_test.cc
         internal/curl_handle_test.cc
         internal/curl_http_payload_test.cc
